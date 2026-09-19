@@ -89,6 +89,8 @@ displayaudiofix logs --follow
 
 The full LaunchDaemon can restart the system `coreaudiod` service and is the recommended installation. If administrator authorization is unavailable, run `install-user.sh`; the user LaunchAgent can probe, select, monitor, and retry, but cannot restart system `coreaudiod`.
 
+Run only one watcher. Do not leave an older `/usr/local/bin/displayaudiofix` LaunchDaemon and a separate user agent managing the same output at the same time; competing recovery loops can re-trigger the DisplayPort failure. The current watcher also takes a shared lock at `/tmp/com.displayaudiofix.watch.lock`, and a full `install.sh` removes the matching user agent before starting the system daemon.
+
 ## Configuration
 
 Edit `/Library/Application Support/DisplayAudioFix/config.json`, then restart the daemon:
