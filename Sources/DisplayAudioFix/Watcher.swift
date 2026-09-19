@@ -100,10 +100,15 @@ final class Watcher {
     private func handleLogLine(_ line: String) {
         let lower = line.lowercased()
         guard !lower.contains("filtering the log data") else { return }
-        guard lower.contains("could not establish a timeline") ||
-                lower.contains("1937010544") ||
-                lower.contains("startiothread") ||
-                (lower.contains("device") && lower.contains("is not running")) else { return }
+        let hardTimelineFailure = lower.contains("could not establish a timeline")
+        let deviceStopped = lower.contains("device") && lower.contains("is not running")
+        let failedStart = lower.contains("startiothread") &&
+            (lower.contains("failed to start") || lower.contains("1937010544"))
+        // During a display reconnect CoreAudio can emit
+        // `mIODisableCount != 0` while it is deliberately pausing an IO
+        // context. That transition is not a failure; treating it as one can
+        // restart coreaudiod in the middle of BetterDisplay's re-enumeration.
+        guard hardTimelineFailure || deviceStopped || lower.contains("1937010544") || failedStart else { return }
         guard shouldTreatAsDisplayFailure(logLine: lower) else {
             return
         }
