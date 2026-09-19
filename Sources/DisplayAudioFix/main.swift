@@ -15,6 +15,7 @@ func usage() -> Never {
       status                 concise device, health, daemon, and recovery status
       devices                enumerate CoreAudio output devices
       test [--audible]       run a bounded silent (or quiet audible) playback probe
+      restore                select the preferred output after a successful probe
       set-rate <hz>          set the preferred device nominal sample rate
       repair                 run staged recovery (uses sudo when needed)
       watch                  monitor CoreAudio and recover automatically
@@ -133,6 +134,27 @@ func commandTest(audible: Bool) -> Int32 {
     return result == .healthy ? 0 : 1
 }
 
+func commandRestore() -> Int32 {
+    guard let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2) else {
+        fputs("preferred output is not currently enumerated\n", stderr)
+        return 1
+    }
+    let result = checker.test(device: preferred, timeout: config.healthCheckTimeoutSeconds, audible: false)
+    guard result == .healthy else {
+        fputs("preferred output failed health check: \(result)\n", stderr)
+        return 1
+    }
+    do {
+        try audio.setDefaultOutput(preferred)
+        print("Restored \(preferred.name) as default and system output")
+        print("HEALTHY")
+        return 0
+    } catch {
+        fputs("failed to restore preferred output: \(error)\n", stderr)
+        return 1
+    }
+}
+
 func commandSetRate(_ value: String?) -> Never {
     guard let value, let rate = Double(value), rate > 0,
           let preferred = audio.preferredDevice(named: config.preferredDeviceName) else {
@@ -175,6 +197,7 @@ switch command {
 case "status": commandStatus()
 case "devices": commandDevices()
 case "test": exit(commandTest(audible: arguments.contains("--audible")))
+case "restore": exit(commandRestore())
 case "set-rate": commandSetRate(arguments.dropFirst().first)
 case "repair": commandRepair()
 case "watch":

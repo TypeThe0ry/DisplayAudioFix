@@ -128,6 +128,7 @@ For a one-off source-tree test, `DISPLAYAUDIOFIX_PREFERRED_DEVICE` overrides the
 displayaudiofix status
 displayaudiofix devices
 displayaudiofix test [--audible]
+displayaudiofix restore
 displayaudiofix set-rate <hz>
 displayaudiofix repair
 displayaudiofix watch
@@ -139,6 +140,8 @@ displayaudiofix uninstall
 `repair`, `install`, and `uninstall` prompt through `sudo` when not already root. A manual repair bypasses automatic rate limiting, but still performs one staged recovery and one delayed post-recovery probe retry. Automatic recovery has no window-wide attempt cap; the cooldown only prevents concurrent/tight-loop restarts.
 
 `set-rate` is a diagnostic/recovery command for the configured preferred device. It changes the CoreAudio nominal sample-rate property; it does not change display resolution or refresh rate.
+
+`restore` first runs the real silent playback probe and only then selects the preferred display output as both default and system output. It is useful after a reconnect when the endpoint is healthy again but macOS is still left on the built-in speakers; it does not require administrator privileges.
 
 ## Uninstall
 
