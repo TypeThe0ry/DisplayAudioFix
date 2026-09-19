@@ -36,6 +36,11 @@ enum Installer {
             exit(1)
         }
         _ = ProcessRunner.run("/bin/launchctl", ["bootout", "system/\(label)"])
+        // Do not leave a per-user watcher racing the newly installed system
+        // daemon against the same CoreAudio device.
+        if let uid = ProcessInfo.processInfo.environment["SUDO_UID"], uid != "0" {
+            _ = ProcessRunner.run("/bin/launchctl", ["bootout", "gui/\(uid)/com.displayaudiofix.agent"])
+        }
         let loaded = ProcessRunner.run("/bin/launchctl", ["bootstrap", "system", plist])
         guard loaded.status == 0 else {
             fputs("launchctl bootstrap failed: \(loaded.output)\n", stderr)

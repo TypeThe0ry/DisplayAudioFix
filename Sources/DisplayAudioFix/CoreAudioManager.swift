@@ -1,6 +1,10 @@
 import CoreAudio
 import Foundation
 
+private final class DeviceListBox {
+    var value: [AudioDeviceInfo] = []
+}
+
 enum CoreAudioError: Error, CustomStringConvertible {
     case property(String, OSStatus)
     case noOutputDevice(String)
@@ -17,6 +21,26 @@ final class CoreAudioManager {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
     func devices() -> [AudioDeviceInfo] {
+        devicesUnbounded()
+    }
+
+    /// CoreAudio property calls can themselves block while coreaudiod is
+    /// wedged during a display hot-switch. Keep watcher/CLI control paths
+    /// bounded so one stuck HAL call cannot permanently stop recovery.
+    func boundedDevices(timeout: TimeInterval = 2) -> [AudioDeviceInfo]? {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = DeviceListBox()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            box.value = self?.devicesUnbounded() ?? []
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + max(timeout, 0.1)) == .success else {
+            return nil
+        }
+        return box.value
+    }
+
+    private func devicesUnbounded() -> [AudioDeviceInfo] {
         let defaultID = defaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice)
         let systemID = defaultDevice(selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
         var address = AudioObjectPropertyAddress(
@@ -54,8 +78,22 @@ final class CoreAudioManager {
         devices().first(where: { $0.isDefaultOutput })
     }
 
+    func boundedDefaultOutputDevice(timeout: TimeInterval = 2) -> AudioDeviceInfo? {
+        guard let snapshot = boundedDevices(timeout: timeout) else { return nil }
+        return snapshot.first(where: { $0.isDefaultOutput })
+    }
+
     func preferredDevice(named name: String, stableUID: String? = nil) -> AudioDeviceInfo? {
         let current = devices()
+        return findPreferred(in: current, named: name, stableUID: stableUID)
+    }
+
+    func boundedPreferredDevice(named name: String, stableUID: String? = nil, timeout: TimeInterval = 2) -> AudioDeviceInfo? {
+        guard let current = boundedDevices(timeout: timeout) else { return nil }
+        return findPreferred(in: current, named: name, stableUID: stableUID)
+    }
+
+    private func findPreferred(in current: [AudioDeviceInfo], named name: String, stableUID: String? = nil) -> AudioDeviceInfo? {
         if let exact = current.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
             return exact
         }
@@ -68,6 +106,14 @@ final class CoreAudioManager {
 
     func builtInFallback() -> AudioDeviceInfo? {
         let outputs = devices().filter(\.isBuiltInOutput)
+        return outputs.first(where: {
+            let lowered = $0.name.lowercased()
+            return lowered.contains("macbook") || lowered.contains("built-in") || lowered.contains("internal")
+        }) ?? outputs.first
+    }
+
+    func boundedBuiltInFallback(timeout: TimeInterval = 2) -> AudioDeviceInfo? {
+        guard let outputs = boundedDevices(timeout: timeout)?.filter(\.isBuiltInOutput) else { return nil }
         return outputs.first(where: {
             let lowered = $0.name.lowercased()
             return lowered.contains("macbook") || lowered.contains("built-in") || lowered.contains("internal")

@@ -56,8 +56,8 @@ func todayKey() -> String {
 }
 
 func commandStatus() {
-    let preferred = audio.preferredDevice(named: config.preferredDeviceName)
-    let current = audio.defaultOutputDevice()
+    let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2)
+    let current = audio.boundedDefaultOutputDevice(timeout: 2)
     let health: HealthStatus
     if let preferred {
         health = checker.test(device: preferred, timeout: config.healthCheckTimeoutSeconds, audible: false)
@@ -98,7 +98,10 @@ func commandStatus() {
 }
 
 func commandDevices() {
-    let devices = audio.devices()
+    guard let devices = audio.boundedDevices(timeout: 3) else {
+        print("CoreAudio device enumeration timed out; coreaudiod may be restarting.")
+        return
+    }
     guard !devices.isEmpty else {
         print("No CoreAudio output devices found.")
         return
@@ -123,7 +126,7 @@ func commandDevices() {
 }
 
 func commandTest(audible: Bool) -> Int32 {
-    let target = audio.preferredDevice(named: config.preferredDeviceName) ?? audio.defaultOutputDevice()
+    let target = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2) ?? audio.boundedDefaultOutputDevice(timeout: 2)
     print("Testing \(target?.name ?? config.preferredDeviceName)\(audible ? " with a quiet 880 Hz tone" : " with silence")...")
     let result = checker.test(device: target, timeout: config.healthCheckTimeoutSeconds, audible: audible)
     print(result)

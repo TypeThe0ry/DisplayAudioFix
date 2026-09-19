@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 final class Watcher {
     private let audio: CoreAudioManager
@@ -12,6 +13,7 @@ final class Watcher {
     private var logProcess: Process?
     private var powerMonitor: PowerMonitor?
     private var healthTimer: DispatchSourceTimer?
+    private var instanceLock: Int32 = -1
     // CoreAudio can emit several lines for one failed start. Coalesce that burst
     // while leaving the periodic probe responsible for the next retry.
     private var lastLogRecoveryAt = Date.distantPast
@@ -24,12 +26,31 @@ final class Watcher {
     }
 
     func run() -> Never {
+        guard acquireSingleInstance() else {
+            logger.log("watch daemon skipped; another DisplayAudioFix watcher is already running")
+            exit(0)
+        }
         logger.log("watch daemon started; preferred device: \(config.preferredDeviceName)")
         startUnifiedLogStream()
         startPeriodicHealthChecks()
         powerMonitor = PowerMonitor { [weak self] in self?.schedulePostWakeCheck() }
         powerMonitor?.start()
         dispatchMain()
+    }
+
+    // The system LaunchDaemon and user LaunchAgent can otherwise both probe
+    // and reset the same CoreAudio endpoint. A shared /tmp advisory lock works
+    // across their different users without requiring another privileged API.
+    private func acquireSingleInstance() -> Bool {
+        let path = "/tmp/com.displayaudiofix.watch.lock"
+        let descriptor = open(path, O_CREAT | O_RDWR, 0o666)
+        guard descriptor >= 0 else { return false }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            close(descriptor)
+            return false
+        }
+        instanceLock = descriptor
+        return true
     }
 
     private func startUnifiedLogStream() {
@@ -93,8 +114,8 @@ final class Watcher {
     }
 
     private func shouldTreatAsDisplayFailure(logLine: String) -> Bool {
-        let current = audio.defaultOutputDevice()
-        let preferred = audio.preferredDevice(named: config.preferredDeviceName)
+        let current = audio.boundedDefaultOutputDevice(timeout: 1.5)
+        let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 1.5)
         if let current, current.isDisplayAudio { return true }
         if let current, current.name.caseInsensitiveCompare(config.preferredDeviceName) == .orderedSame { return true }
         if let preferred, preferred.isDefaultOutput || preferred.isSystemOutput { return true }
@@ -125,8 +146,9 @@ final class Watcher {
         // Keep probing the preferred display even after a failed recovery has
         // selected the built-in fallback. Otherwise the fallback becomes a
         // permanent stop condition and LS24A600U is never retried.
-        guard let preferred = audio.preferredDevice(named: config.preferredDeviceName) else {
-            logger.log("\(reason): preferred device missing", alsoPrint: false)
+        guard let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 1.5) else {
+            logger.log("\(reason): preferred device missing or CoreAudio enumeration timed out", alsoPrint: false)
+            scheduleRetry(reason: "\(reason) could not enumerate preferred device")
             return
         }
         let result = checker.test(device: preferred, timeout: config.healthCheckTimeoutSeconds, audible: false)
@@ -152,6 +174,15 @@ final class Watcher {
     }
 
     private func performRecovery(trigger: String) {
-        _ = recovery.recover(trigger: trigger)
+        let succeeded = recovery.recover(trigger: trigger)
+        if !succeeded {
+            scheduleRetry(reason: "recovery did not complete")
+        }
+    }
+
+    private func scheduleRetry(reason: String) {
+        workQueue.asyncAfter(deadline: .now() + 15) { [weak self] in
+            self?.healthCheckIfUseful(reason: "retry after \(reason)")
+        }
     }
 }
