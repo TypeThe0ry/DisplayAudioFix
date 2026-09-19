@@ -41,6 +41,11 @@ enum Installer {
         if let uid = ProcessInfo.processInfo.environment["SUDO_UID"], uid != "0" {
             _ = ProcessRunner.run("/bin/launchctl", ["bootout", "gui/\(uid)/com.displayaudiofix.agent"])
         }
+        if let user = ProcessInfo.processInfo.environment["SUDO_USER"], !user.isEmpty {
+            if let userHome = NSHomeDirectoryForUser(user), !userHome.isEmpty {
+                try? manager.removeItem(atPath: userHome + "/Library/LaunchAgents/com.displayaudiofix.agent.plist")
+            }
+        }
         let loaded = ProcessRunner.run("/bin/launchctl", ["bootstrap", "system", plist])
         guard loaded.status == 0 else {
             fputs("launchctl bootstrap failed: \(loaded.output)\n", stderr)
