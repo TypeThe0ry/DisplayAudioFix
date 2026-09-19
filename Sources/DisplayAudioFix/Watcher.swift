@@ -14,6 +14,10 @@ final class Watcher {
     private var powerMonitor: PowerMonitor?
     private var healthTimer: DispatchSourceTimer?
     private var instanceLock: Int32 = -1
+    // A display reconnect can produce dozens of CoreAudio log lines. Keep one
+    // delayed retry for the whole burst; otherwise each line schedules another
+    // recovery and competes with BetterDisplay's own AudioQueue client.
+    private var retryScheduled = false
     // CoreAudio can emit several lines for one failed start. Coalesce that burst
     // while leaving the periodic probe responsible for the next retry.
     private var lastLogRecoveryAt = Date.distantPast
@@ -153,6 +157,7 @@ final class Watcher {
         }
         let result = checker.test(device: preferred, timeout: config.healthCheckTimeoutSeconds, audible: false)
         if result == .healthy {
+            retryScheduled = false
             if preferred.isDefaultOutput && preferred.isSystemOutput {
                 logger.log("\(reason): HEALTHY", alsoPrint: false)
             } else {
@@ -181,8 +186,12 @@ final class Watcher {
     }
 
     private func scheduleRetry(reason: String) {
+        guard !retryScheduled else { return }
+        retryScheduled = true
         workQueue.asyncAfter(deadline: .now() + 15) { [weak self] in
-            self?.healthCheckIfUseful(reason: "retry after \(reason)")
+            guard let self else { return }
+            self.retryScheduled = false
+            self.healthCheckIfUseful(reason: "retry after \(reason)")
         }
     }
 }

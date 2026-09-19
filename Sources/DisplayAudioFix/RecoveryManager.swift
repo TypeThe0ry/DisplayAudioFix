@@ -1,6 +1,10 @@
 import Foundation
 
 final class RecoveryManager {
+    private struct BetterDisplaySession {
+        let uid: String
+    }
+
     private let audio: CoreAudioManager
     private let checker: HealthChecker
     private let config: Configuration
@@ -69,6 +73,15 @@ final class RecoveryManager {
         guard let fallback = audio.boundedBuiltInFallback(timeout: 2) else {
             logger.log("recovery failed: no built-in output device found")
             return false
+        }
+        // BetterDisplay can retain an AudioQueue/IO context across a display
+        // reconnect. Stop that stale client before restarting coreaudiod, then
+        // relaunch it after the preferred endpoint passes a real probe.
+        let betterDisplaySession = stopBetterDisplayForRecovery()
+        defer {
+            if let betterDisplaySession {
+                relaunchBetterDisplay(for: betterDisplaySession)
+            }
         }
         do {
             try audio.setDefaultOutput(fallback)
@@ -145,6 +158,35 @@ final class RecoveryManager {
     private func selectFreshFallback(named oldName: String) {
         if let fresh = audio.boundedDevices(timeout: 1.5)?.first(where: { $0.name == oldName }) ?? audio.boundedBuiltInFallback(timeout: 1.5) {
             try? audio.setDefaultOutput(fresh)
+        }
+    }
+
+    private func stopBetterDisplayForRecovery() -> BetterDisplaySession? {
+        let found = ProcessRunner.run("/usr/bin/pgrep", ["-x", "BetterDisplay"])
+        guard let pid = found.output
+            .split(whereSeparator: \.isNewline)
+            .compactMap({ Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+            .first else { return nil }
+        let uidOutput = ProcessRunner.run("/bin/ps", ["-o", "uid=", "-p", String(pid)]).output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !uidOutput.isEmpty, uidOutput != "0" else { return nil }
+        let terminated = ProcessRunner.run("/bin/kill", ["-TERM", String(pid)]).status == 0
+        guard terminated else {
+            logger.log("BetterDisplay was detected but could not be stopped; continuing without app restart")
+            return nil
+        }
+        logger.log("paused BetterDisplay before CoreAudio recovery")
+        return BetterDisplaySession(uid: uidOutput)
+    }
+
+    private func relaunchBetterDisplay(for session: BetterDisplaySession) {
+        let launched = ProcessRunner.run("/bin/launchctl", [
+            "asuser", session.uid, "/usr/bin/open", "-b", "pro.betterdisplay.BetterDisplay"
+        ])
+        if launched.status == 0 {
+            logger.log("restarted BetterDisplay after CoreAudio recovery")
+        } else {
+            logger.log("BetterDisplay restart failed: \(launched.output.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
     }
 

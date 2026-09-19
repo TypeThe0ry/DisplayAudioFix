@@ -34,6 +34,14 @@ DisplayAudioFix performs the following staged recovery:
 7. Run a bounded silent `AudioQueue` playback probe on the monitor itself.
 8. Keep the built-in output selected if the probe fails, then retry after the cooldown.
 
+When BetterDisplay is running, recovery temporarily terminates and relaunches its
+user-session process around the CoreAudio reset. BetterDisplay can retain an
+`AudioQueue` tied to the old DisplayPort I/O context after a cable or display
+reconnect; leaving that stale client alive can keep both the display utility and
+the monitor audio endpoint blocked with `1937010544`. The relaunch is performed
+only when a recovery is actually needed and uses the existing logged-in user's
+LaunchServices session.
+
 The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the preferred device every 30 seconds, and checks after sleep/wake. There is no window-wide maximum-attempt block in the current implementation.
 
 ## What it does
@@ -44,6 +52,7 @@ The watcher also monitors relevant unified-log events, coalesces duplicate lines
 - Switches to built-in speakers, restarts `coreaudiod`, waits for device discovery, restores the preferred display output, then verifies playback.
 - Enforces a 30-second minimum cooldown while continuing automatic recovery until a real playback probe succeeds.
 - Renegotiates the preferred display's nominal sample rate during recovery to rebuild a wedged DisplayPort I/O context on macOS 27.0.
+- Quiesces and relaunches BetterDisplay around recovery when its process is present, preventing stale AudioQueue clients from surviving a display reconnect.
 - Leaves built-in speakers selected when repair does not restore healthy playback.
 - Rotates `/var/log/displayaudiofix.log` to one `.1` backup at 2 MiB.
 
