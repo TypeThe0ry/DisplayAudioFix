@@ -25,22 +25,19 @@ In testing, changing the endpoint's documented nominal sample-rate property from
 
 DisplayAudioFix performs the following staged recovery:
 
-1. Locate `LS24A600U` by name and record its current UID.
-2. Select the built-in MacBook output temporarily.
-3. Restart only `coreaudiod` with `launchctl kickstart -kp`.
-4. Poll until the DisplayPort endpoint is enumerated again.
-5. Restore it as both default output and system output.
+1. Pause the BetterDisplay user-session process before querying CoreAudio, so a stale `AudioQueue` does not keep the old DisplayPort I/O context wedged.
+2. Record the preferred endpoint UID if it can be enumerated; a temporary enumeration timeout does not abort recovery.
+3. Select the built-in MacBook output when available, but continue if CoreAudio is too wedged to switch yet.
+4. Restart only `coreaudiod` with `launchctl kickstart -kp`.
+5. Poll for the DisplayPort endpoint to be enumerated again, then restore it as both default output and system output.
 6. Toggle its nominal rate and restore the original rate to rebuild its I/O context.
 7. Run a bounded silent `AudioQueue` playback probe on the monitor itself.
-8. Keep the built-in output selected if the probe fails, then retry after the cooldown.
+8. Relaunch BetterDisplay and keep the built-in output selected if the probe fails; retry after the cooldown.
 
-When BetterDisplay is running, recovery temporarily terminates and relaunches its
-user-session process around the CoreAudio reset. BetterDisplay can retain an
-`AudioQueue` tied to the old DisplayPort I/O context after a cable or display
-reconnect; leaving that stale client alive can keep both the display utility and
-the monitor audio endpoint blocked with `1937010544`. The relaunch is performed
-only when a recovery is actually needed and uses the existing logged-in user's
-LaunchServices session.
+BetterDisplay is paused only during an actual recovery and relaunched through
+the existing logged-in user's LaunchServices session. If either the monitor or
+the built-in output is temporarily absent from CoreAudio's device list, the
+recovery still resets `coreaudiod` instead of stopping at the failed query.
 
 The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the preferred device every 30 seconds, and checks after sleep/wake. There is no window-wide maximum-attempt block in the current implementation.
 
@@ -56,7 +53,7 @@ The watcher also monitors relevant unified-log events, coalesces duplicate lines
 - Leaves built-in speakers selected when repair does not restore healthy playback.
 - Rotates `/var/log/displayaudiofix.log` to one `.1` backup at 2 MiB.
 
-It does **not** modify SIP, install kernel extensions, edit Apple system files, delete audio preferences, kill applications, change display settings, or use private frameworks.
+It does **not** modify SIP, install kernel extensions, edit Apple system files, delete audio preferences, kill unrelated applications, change display settings, or use private frameworks. During a needed recovery only, it sends `TERM` to BetterDisplay and relaunches it after the audio recovery attempt.
 
 ## Build and inspect
 
@@ -75,10 +72,20 @@ swift build -c release
 
 ## Install
 
+From a fresh clone, deploy with:
+
 ```sh
-chmod +x install.sh uninstall.sh
+git clone https://github.com/TypeThe0ry/DisplayAudioFix.git
+cd DisplayAudioFix
 ./install.sh
 ```
+
+`install.sh` is committed as executable, builds the release binary, asks for
+administrator authorization, installs the system LaunchDaemon, and starts it.
+No separate `chmod`, manual file copy, or background terminal is needed. Run
+the command in Terminal and let it finish; do not suspend it with Ctrl-Z. When
+Terminal asks for your macOS login password, typing is intentionally invisible;
+type it and press Return.
 
 The installer uses `sudo` when required and installs:
 
@@ -175,6 +182,6 @@ If `status` reports the built-in speakers, that is a protective fallback, not a 
 
 ## Safety And Scope
 
-DisplayAudioFix uses documented CoreAudio, AudioToolbox, Foundation, and `launchctl` interfaces. It does not modify SIP or Apple system files, install kernel extensions, use private audio frameworks, delete audio preference databases, kill unrelated applications, disable other monitors, or modify display resolution/refresh rate.
+DisplayAudioFix uses documented CoreAudio, AudioToolbox, Foundation, and `launchctl` interfaces. It does not modify SIP or Apple system files, install kernel extensions, use private audio frameworks, delete audio preference databases, kill unrelated applications, disable other monitors, or modify display resolution/refresh rate. During a needed recovery it temporarily terminates and relaunches BetterDisplay so its stale audio client releases the old display endpoint.
 
 No license file is currently included. Add the license that matches how you intend to distribute this project before publishing it for reuse.

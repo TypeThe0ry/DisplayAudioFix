@@ -58,47 +58,54 @@ final class RecoveryManager {
         recordAttempt()
         logger.log("recovery started (trigger: \(trigger))")
 
-        logger.log("recovery stage 1: locating preferred output \(config.preferredDeviceName)")
-        guard let preferredBefore = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2) else {
-            logger.log("recovery failed: preferred device is missing")
-            return false
-        }
-        let stableUID = preferredBefore.uid
-        guard preferredBefore.outputChannels > 0 else {
-            logger.log("recovery failed: preferred device has no output channels")
-            return false
-        }
-
-        logger.log("recovery stage 2: selecting built-in fallback")
-        guard let fallback = audio.boundedBuiltInFallback(timeout: 2) else {
-            logger.log("recovery failed: no built-in output device found")
-            return false
-        }
         // BetterDisplay can retain an AudioQueue/IO context across a display
-        // reconnect. Stop that stale client before restarting coreaudiod, then
-        // relaunch it after the preferred endpoint passes a real probe.
+        // reconnect. Quiesce it before making CoreAudio property calls: on the
+        // affected failure path those calls can time out while its stale client
+        // still owns the old DisplayPort I/O context.
+        logger.log("recovery stage 1: pausing BetterDisplay before CoreAudio queries")
         let betterDisplaySession = stopBetterDisplayForRecovery()
         defer {
             if let betterDisplaySession {
                 relaunchBetterDisplay(for: betterDisplaySession)
             }
         }
-        do {
-            try audio.setDefaultOutput(fallback)
-            logger.log("switching temporary output to \(fallback.name)")
-        } catch {
-            logger.log("recovery failed while selecting fallback: \(error)")
-            return false
+
+        logger.log("recovery stage 2: locating preferred output \(config.preferredDeviceName)")
+        let preferredBefore = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2)
+        let stableUID = preferredBefore?.uid
+        if preferredBefore == nil {
+            // A transiently unqueryable endpoint is exactly what a wedged HAL
+            // can look like. Do not abort before restarting coreaudiod.
+            logger.log("preferred output is not enumerable yet; continuing with CoreAudio reset")
+        } else if preferredBefore?.outputChannels == 0 {
+            logger.log("preferred output currently reports no channels; continuing with CoreAudio reset")
         }
 
-        logger.log("recovery stage 3: restarting coreaudiod")
+        logger.log("recovery stage 3: selecting built-in fallback when available")
+        let fallback = audio.boundedBuiltInFallback(timeout: 2)
+        if let fallback {
+            do {
+                try audio.setDefaultOutput(fallback)
+                logger.log("switching temporary output to \(fallback.name)")
+            } catch {
+                // The fallback switch can fail for the same reason enumeration
+                // failed. Still restart coreaudiod and retry the fallback after
+                // it has rebuilt its device graph.
+                logger.log("could not select fallback before CoreAudio reset: \(error); continuing")
+            }
+        } else {
+            logger.log("built-in output is not enumerable yet; continuing with CoreAudio reset")
+        }
+
+        logger.log("recovery stage 4: restarting coreaudiod")
         let restart = ProcessRunner.run("/bin/launchctl", ["kickstart", "-kp", "system/com.apple.audio.coreaudiod"])
         guard restart.status == 0 else {
             logger.log("coreaudiod restart failed: \(restart.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+            selectFreshFallback(named: fallback?.name)
             return false
         }
 
-        logger.log("recovery stage 4: waiting for CoreAudio device enumeration")
+        logger.log("recovery stage 5: waiting for CoreAudio device enumeration")
         // Hot-switches can leave CoreAudio unresponsive for longer than the
         // original 15-second window. Poll in short bounded calls for up to a
         // minute so one blocked property query cannot wedge the watcher.
@@ -115,25 +122,29 @@ final class RecoveryManager {
             delay = min(delay * 1.5, 2.0)
         }
         guard let restored else {
-            logger.log("preferred output did not reappear within 60 seconds; leaving \(fallback.name) selected")
-            selectFreshFallback(named: fallback.name)
+            if let fallback {
+                logger.log("preferred output did not reappear within 60 seconds; leaving \(fallback.name) selected")
+            } else {
+                logger.log("preferred output did not reappear within 60 seconds; selecting any available built-in output")
+            }
+            selectFreshFallback(named: fallback?.name)
             return false
         }
         logger.log("\(restored.name) rediscovered")
 
-        logger.log("recovery stage 5: restoring \(restored.name) as default and system output")
+        logger.log("recovery stage 6: restoring \(restored.name) as default and system output")
         do {
             try audio.setDefaultOutput(restored)
         } catch {
             logger.log("failed to restore preferred output: \(error); leaving built-in output selected")
-            selectFreshFallback(named: fallback.name)
+            selectFreshFallback(named: fallback?.name)
             return false
         }
 
-        logger.log("recovery stage 5b: renegotiating \(restored.name) sample rate")
+        logger.log("recovery stage 6b: renegotiating \(restored.name) sample rate")
         renegotiateSampleRate(for: restored)
 
-        logger.log("recovery stage 6: running silent playback health check")
+        logger.log("recovery stage 7: running silent playback health check")
         var result = checker.test(device: audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: stableUID, timeout: 1.5), timeout: config.healthCheckTimeoutSeconds, audible: false)
         if result != .healthy {
             logger.log("post-recovery health check returned \(result); retrying once after 2 seconds")
@@ -146,8 +157,12 @@ final class RecoveryManager {
             }
         }
         guard result == .healthy else {
-            logger.log("recovery unsuccessful (\(result)); leaving \(fallback.name) selected")
-            selectFreshFallback(named: fallback.name)
+            if let fallback {
+                logger.log("recovery unsuccessful (\(result)); leaving \(fallback.name) selected")
+            } else {
+                logger.log("recovery unsuccessful (\(result)); selecting any available built-in output")
+            }
+            selectFreshFallback(named: fallback?.name)
             return false
         }
         logger.log("silent health check successful")
@@ -155,8 +170,11 @@ final class RecoveryManager {
         return true
     }
 
-    private func selectFreshFallback(named oldName: String) {
-        if let fresh = audio.boundedDevices(timeout: 1.5)?.first(where: { $0.name == oldName }) ?? audio.boundedBuiltInFallback(timeout: 1.5) {
+    private func selectFreshFallback(named oldName: String?) {
+        let namedFallback = oldName.flatMap { name in
+            audio.boundedDevices(timeout: 1.5)?.first(where: { $0.name == name })
+        }
+        if let fresh = namedFallback ?? audio.boundedBuiltInFallback(timeout: 1.5) {
             try? audio.setDefaultOutput(fresh)
         }
     }
