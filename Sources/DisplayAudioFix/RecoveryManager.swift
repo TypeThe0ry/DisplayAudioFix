@@ -300,13 +300,14 @@ final class RecoveryManager {
             return
         }
 
-        // Preserve a deliberate user mute; for the normal unmuted case,
-        // writing the same value wakes the monitor's headphone/line-out path
-        // after a reconnect. BetterDisplay maps these commands to the
-        // display's DDC mute/volume controller.
-        guard !muted else {
-            logger.log("preserving monitor mute state (user mute is on)")
-            return
+        // A reconnect can leave the monitor's DDC mute bit latched even
+        // though CoreAudio reports a healthy queue. This utility's contract
+        // is to restore audible LS24A600U output, so clear that stale mute
+        // bit during a successful recovery. BetterDisplay maps this command
+        // to the display's DDC mute controller; the following volume write
+        // restores the current level instead of changing it.
+        if muted {
+            logger.log("monitor mute was on after reconnect; clearing stale DDC mute")
         }
 
         let muteWrite = ProcessRunner.run("/bin/launchctl", baseArguments + [

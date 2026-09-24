@@ -50,8 +50,8 @@ DisplayAudioFix performs the following staged recovery:
    recovery probe succeeds, read the monitor's DDC mute/volume state through
    BetterDisplay, write the same unmuted/volume values back to wake the
    LS24A600U headphone jack, and reassert LS24A600U as the default after the
-   app has recreated its audio client. An intentional monitor mute or volume
-   level is preserved. If the probe fails, the built-in output remains selected
+   app has recreated its audio client. A reconnect-stale monitor mute is
+   cleared; the current volume level is preserved. If the probe fails, the built-in output remains selected
    and the watcher retries after the cooldown. A shared advisory lock prevents
    the system daemon, a user agent, and a manual `repair` command from resetting
    CoreAudio concurrently.
@@ -72,9 +72,9 @@ The watcher also monitors relevant unified-log events, coalesces duplicate lines
 - Enforces a 30-second minimum cooldown while continuing automatic recovery until a real playback probe succeeds; the cooldown is not an attempt limit.
 - Renegotiates the preferred display's nominal sample rate during recovery to rebuild a wedged DisplayPort I/O context on macOS 27.0.
 - Quiesces and relaunches BetterDisplay around recovery when its process is present. It waits up to five seconds for a graceful exit and escalates to `SIGKILL` only for that already-identified, non-root BetterDisplay process if it is wedged, so the stale AudioQueue cannot survive into the next reconnect.
-- After a successful recovery, reinitializes the LS24A600U monitor-side DDC
-  audio mute/volume registers without changing the user's saved values, then
-  reasserts the display as the default after BetterDisplay relaunches.
+- After a successful recovery, clears a reconnect-stale LS24A600U monitor-side
+  DDC mute bit, re-writes the current volume level, and reasserts the display
+  as the default after BetterDisplay relaunches.
 - Leaves built-in speakers selected when repair does not restore healthy playback.
 - Rotates `/var/log/displayaudiofix.log` to one `.1` backup at 2 MiB.
 
