@@ -46,7 +46,15 @@ DisplayAudioFix performs the following staged recovery:
 5. Poll for the DisplayPort endpoint to be enumerated again, then restore it as both default output and system output.
 6. Toggle its nominal rate and restore the original rate to rebuild its I/O context.
 7. Run a bounded silent `AudioQueue` playback probe on the monitor itself.
-8. Relaunch BetterDisplay only after its old process has exited, keep the built-in output selected if the probe fails, and retry after the cooldown. A shared advisory lock prevents the system daemon, a user agent, and a manual `repair` command from resetting CoreAudio concurrently.
+8. Relaunch BetterDisplay only after its old process has exited. When the
+   recovery probe succeeds, read the monitor's DDC mute/volume state through
+   BetterDisplay, write the same unmuted/volume values back to wake the
+   LS24A600U headphone jack, and reassert LS24A600U as the default after the
+   app has recreated its audio client. An intentional monitor mute or volume
+   level is preserved. If the probe fails, the built-in output remains selected
+   and the watcher retries after the cooldown. A shared advisory lock prevents
+   the system daemon, a user agent, and a manual `repair` command from resetting
+   CoreAudio concurrently.
 
 BetterDisplay is paused only during an actual recovery and relaunched through
 the existing logged-in user's LaunchServices session. If either the monitor or
@@ -63,7 +71,10 @@ The watcher also monitors relevant unified-log events, coalesces duplicate lines
 - Switches to built-in speakers, restarts `coreaudiod`, waits for device discovery, restores the preferred display output, then verifies playback.
 - Enforces a 30-second minimum cooldown while continuing automatic recovery until a real playback probe succeeds; the cooldown is not an attempt limit.
 - Renegotiates the preferred display's nominal sample rate during recovery to rebuild a wedged DisplayPort I/O context on macOS 27.0.
-- Quiesces and relaunches BetterDisplay around recovery when its process is present, waiting up to five seconds for its old AudioQueue client to exit before CoreAudio is reset.
+- Quiesces and relaunches BetterDisplay around recovery when its process is present. It waits up to five seconds for a graceful exit and escalates to `SIGKILL` only for that already-identified, non-root BetterDisplay process if it is wedged, so the stale AudioQueue cannot survive into the next reconnect.
+- After a successful recovery, reinitializes the LS24A600U monitor-side DDC
+  audio mute/volume registers without changing the user's saved values, then
+  reasserts the display as the default after BetterDisplay relaunches.
 - Leaves built-in speakers selected when repair does not restore healthy playback.
 - Rotates `/var/log/displayaudiofix.log` to one `.1` backup at 2 MiB.
 
@@ -205,7 +216,7 @@ If `status` reports the built-in speakers, that is a protective fallback, not a 
 
 ## Safety And Scope
 
-DisplayAudioFix uses documented CoreAudio, AudioToolbox, Foundation, and `launchctl` interfaces. It does not modify SIP or Apple system files, install kernel extensions, use private audio frameworks, delete audio preference databases, kill unrelated applications, disable other monitors, or modify display resolution/refresh rate. During a needed recovery it temporarily terminates and relaunches BetterDisplay so its stale audio client releases the old display endpoint.
+DisplayAudioFix uses documented CoreAudio, AudioToolbox, Foundation, and `launchctl` interfaces. It does not modify SIP or Apple system files, install kernel extensions, use private audio frameworks, delete audio preference databases, kill unrelated applications, disable other monitors, or modify display resolution/refresh rate. During a needed recovery it temporarily terminates and relaunches BetterDisplay so its stale audio client releases the old display endpoint; if that identified BetterDisplay process ignores `TERM`, the recovery escalates only that process to `SIGKILL`.
 
 Other applications can also own the same DisplayPort audio UID. In particular, remote-desktop or video-capture applications may reopen an old audio context immediately after a repair. DisplayAudioFix records those failures and never kills unrelated applications automatically; if the log names a non-BetterDisplay client, close or pause that client while testing the reconnect. A repair is considered successful only when the monitor is the current default and the active AudioQueue probe reports `HEALTHY`.
 

@@ -6,6 +6,8 @@ final class RecoveryManager {
         let uid: String
     }
 
+    private let betterDisplayExecutable = "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay"
+
     private let audio: CoreAudioManager
     private let checker: HealthChecker
     private let config: Configuration
@@ -72,9 +74,21 @@ final class RecoveryManager {
         // still owns the old DisplayPort I/O context.
         logger.log("recovery stage 1: pausing BetterDisplay before CoreAudio queries")
         let betterDisplaySession = stopBetterDisplayForRecovery()
+        var shouldReassertPreferredAfterBetterDisplay = false
         defer {
             if let betterDisplaySession {
                 relaunchBetterDisplay(for: betterDisplaySession)
+                if shouldReassertPreferredAfterBetterDisplay {
+                    // BetterDisplay can reopen the display's audio client and
+                    // leave the monitor's analog jack asleep even though the
+                    // CoreAudio queue is healthy. Re-write the current DDC
+                    // mute/volume values after the app is back, then assert
+                    // the preferred endpoint once more. The values are read
+                    // first so an intentional user mute or volume level is
+                    // never overwritten.
+                    reinitializeMonitorAudio(for: betterDisplaySession)
+                    reassertPreferredOutputAfterBetterDisplay()
+                }
             }
         }
 
@@ -182,6 +196,7 @@ final class RecoveryManager {
         }
         logger.log("silent health check successful")
         logger.log("recovery completed")
+        shouldReassertPreferredAfterBetterDisplay = true
         return true
     }
 
@@ -226,9 +241,33 @@ final class RecoveryManager {
         let stillRunning = terminatedPIDs.contains {
             ProcessRunner.run("/bin/kill", ["-0", String($0)]).status == 0
         }
-        guard !stillRunning else {
-            logger.log("BetterDisplay did not exit within 5 seconds; continuing without relaunch")
-            return nil
+        if stillRunning {
+            // A wedged BetterDisplay client is the failure mode this recovery
+            // is meant to contain. Escalate only the non-root processes that
+            // we already identified as BetterDisplay after a graceful TERM;
+            // leaving a hung client alive would keep the stale DisplayPort
+            // AudioQueue attached and make the next reconnect fail again.
+            logger.log("BetterDisplay did not exit within 5 seconds; escalating to SIGKILL")
+            for pid in terminatedPIDs {
+                if ProcessRunner.run("/bin/kill", ["-0", String(pid)]).status == 0 {
+                    _ = ProcessRunner.run("/bin/kill", ["-KILL", String(pid)])
+                }
+            }
+            let hardDeadline = Date().addingTimeInterval(2)
+            while Date() < hardDeadline {
+                let alive = terminatedPIDs.contains {
+                    ProcessRunner.run("/bin/kill", ["-0", String($0)]).status == 0
+                }
+                if !alive { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            let stillAliveAfterKill = terminatedPIDs.contains {
+                ProcessRunner.run("/bin/kill", ["-0", String($0)]).status == 0
+            }
+            guard !stillAliveAfterKill else {
+                logger.log("BetterDisplay could not be terminated; continuing without relaunch")
+                return nil
+            }
         }
         logger.log("paused BetterDisplay before CoreAudio recovery")
         return BetterDisplaySession(uid: uid)
@@ -240,9 +279,114 @@ final class RecoveryManager {
         ])
         if launched.status == 0 {
             logger.log("restarted BetterDisplay after CoreAudio recovery")
+            // LaunchServices returns before the app has recreated its DDC and
+            // audio controllers. Give it a short bounded startup window
+            // before issuing the hardware audio reinitialization below.
+            Thread.sleep(forTimeInterval: 1.5)
         } else {
             logger.log("BetterDisplay restart failed: \(launched.output.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
+    }
+
+    private func reinitializeMonitorAudio(for session: BetterDisplaySession) {
+        guard FileManager.default.isExecutableFile(atPath: betterDisplayExecutable) else {
+            logger.log("BetterDisplay audio reinitialization skipped: executable not found")
+            return
+        }
+
+        let baseArguments = ["asuser", session.uid, betterDisplayExecutable]
+        guard let muted = readBetterDisplayMuteState(baseArguments: baseArguments) else {
+            logger.log("BetterDisplay audio reinitialization skipped: could not read monitor mute state")
+            return
+        }
+
+        // Preserve a deliberate user mute; for the normal unmuted case,
+        // writing the same value wakes the monitor's headphone/line-out path
+        // after a reconnect. BetterDisplay maps these commands to the
+        // display's DDC mute/volume controller.
+        guard !muted else {
+            logger.log("preserving monitor mute state (user mute is on)")
+            return
+        }
+
+        let muteWrite = ProcessRunner.run("/bin/launchctl", baseArguments + [
+            "set", "-nameLike=\(config.preferredDeviceName)", "-mute=off"
+        ], timeout: 4)
+        guard muteWrite.status == 0 else {
+            logger.log("monitor DDC mute reinitialization failed: \(muteWrite.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+            return
+        }
+
+        if let volume = readBetterDisplayVolume(baseArguments: baseArguments),
+           volume >= 0, volume <= 1 {
+            let volumeValue = String(format: "%.4f", volume)
+            let volumeWrite = ProcessRunner.run("/bin/launchctl", baseArguments + [
+                "set", "-nameLike=\(config.preferredDeviceName)", "-volume=\(volumeValue)"
+            ], timeout: 4)
+            if volumeWrite.status == 0 {
+                logger.log("reinitialized monitor DDC audio path (mute=unmuted, volume=\(volumeValue))")
+            } else {
+                logger.log("monitor DDC volume reinitialization failed: \(volumeWrite.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        } else {
+            logger.log("reinitialized monitor DDC mute state; volume read was unavailable")
+        }
+    }
+
+    private func readBetterDisplayMuteState(baseArguments: [String]) -> Bool? {
+        for attempt in 0..<3 {
+            let result = ProcessRunner.run("/bin/launchctl", baseArguments + [
+                "get", "-nameLike=\(config.preferredDeviceName)", "-mute", "-value"
+            ], timeout: 4)
+            if result.status == 0 {
+                let value = result.output.lowercased()
+                if value.contains("off") { return false }
+                if value.contains("on") { return true }
+            }
+            if attempt < 2 {
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+        }
+        return nil
+    }
+
+    private func readBetterDisplayVolume(baseArguments: [String]) -> Double? {
+        for attempt in 0..<3 {
+            let result = ProcessRunner.run("/bin/launchctl", baseArguments + [
+                "get", "-nameLike=\(config.preferredDeviceName)", "-volume", "-value", "-min", "-max"
+            ], timeout: 4)
+            if result.status == 0 {
+                for line in result.output.split(whereSeparator: \.isNewline) {
+                    let token = line.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: true)
+                        .first?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let token, let value = Double(token) {
+                        return value
+                    }
+                }
+            }
+            if attempt < 2 {
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+        }
+        return nil
+    }
+
+    private func reassertPreferredOutputAfterBetterDisplay() {
+        let state = stateStore.load()
+        guard let preferred = audio.boundedPreferredDevice(
+            named: config.preferredDeviceName,
+            stableUID: state.preferredDeviceUID,
+            timeout: 2
+        ) else {
+            logger.log("preferred output could not be re-enumerated after BetterDisplay relaunch")
+            return
+        }
+        guard audio.boundedSetDefaultOutput(preferred, timeout: 2) else {
+            logger.log("preferred output could not be reasserted after BetterDisplay relaunch")
+            return
+        }
+        logger.log("reasserted \(preferred.name) as default output after BetterDisplay relaunch")
     }
 
     private func renegotiateSampleRate(for device: AudioDeviceInfo) {
