@@ -53,6 +53,11 @@ enum Installer {
         }
         _ = ProcessRunner.run("/bin/launchctl", ["kickstart", "-k", "system/\(label)"])
         print("DisplayAudioFix installed and running. Configuration: \(Configuration.configurationPath)")
+        let digest = ProcessRunner.run("/usr/bin/shasum", ["-a", "256", binary]).output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !digest.isEmpty {
+            print("Installed binary: \(digest)")
+        }
         exit(0)
     }
 
