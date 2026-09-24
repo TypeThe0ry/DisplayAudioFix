@@ -28,13 +28,19 @@ enum CoreAudioError: Error, CustomStringConvertible {
 final class CoreAudioManager {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
     private let snapshotQueryLock = NSLock()
-    private var snapshotQueryInFlight = false
+    private var snapshotQueriesInFlight = 0
     private let uidQueryLock = NSLock()
-    private var uidQueryInFlight = false
+    private var uidQueriesInFlight = 0
     private let defaultWriteLock = NSLock()
-    private var defaultWriteInFlight = false
+    private var defaultWritesInFlight = 0
     private let rateWriteLock = NSLock()
-    private var rateWriteInFlight = false
+    private var rateWritesInFlight = 0
+
+    // CoreAudio calls cannot be cancelled once they enter the HAL. Permit a
+    // small bounded number of replacement attempts after a timeout so one
+    // permanently wedged worker does not make every later recovery return
+    // DEVICE_MISSING or refuse to restore the default output.
+    private let maxTimedOutWorkers = 3
 
     func devices() -> [AudioDeviceInfo] {
         devicesUnbounded()
@@ -45,18 +51,20 @@ final class CoreAudioManager {
     /// bounded so one stuck HAL call cannot permanently stop recovery.
     func boundedDevices(timeout: TimeInterval = 2) -> [AudioDeviceInfo]? {
         snapshotQueryLock.lock()
-        guard !snapshotQueryInFlight else {
+        guard snapshotQueriesInFlight < maxTimedOutWorkers else {
             snapshotQueryLock.unlock()
             return nil
         }
-        snapshotQueryInFlight = true
+        snapshotQueriesInFlight += 1
         snapshotQueryLock.unlock()
         let semaphore = DispatchSemaphore(value: 0)
         let box = DeviceListBox()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             defer {
                 self?.snapshotQueryLock.lock()
-                self?.snapshotQueryInFlight = false
+                if let self, self.snapshotQueriesInFlight > 0 {
+                    self.snapshotQueriesInFlight -= 1
+                }
                 self?.snapshotQueryLock.unlock()
                 semaphore.signal()
             }
@@ -223,8 +231,8 @@ final class CoreAudioManager {
 
     private func boundedDeviceForUID(_ uid: String, name: String, timeout: TimeInterval) -> AudioDeviceInfo? {
         uidQueryLock.lock()
-        guard !uidQueryInFlight else { uidQueryLock.unlock(); return nil }
-        uidQueryInFlight = true
+        guard uidQueriesInFlight < maxTimedOutWorkers else { uidQueryLock.unlock(); return nil }
+        uidQueriesInFlight += 1
         uidQueryLock.unlock()
 
         let semaphore = DispatchSemaphore(value: 0)
@@ -232,7 +240,9 @@ final class CoreAudioManager {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             defer {
                 self?.uidQueryLock.lock()
-                self?.uidQueryInFlight = false
+                if let self, self.uidQueriesInFlight > 0 {
+                    self.uidQueriesInFlight -= 1
+                }
                 self?.uidQueryLock.unlock()
                 semaphore.signal()
             }
@@ -312,18 +322,20 @@ final class CoreAudioManager {
     /// still reach the coreaudiod restart stage instead of waiting forever.
     func boundedSetDefaultOutput(_ device: AudioDeviceInfo, timeout: TimeInterval = 2) -> Bool {
         defaultWriteLock.lock()
-        guard !defaultWriteInFlight else {
+        guard defaultWritesInFlight < maxTimedOutWorkers else {
             defaultWriteLock.unlock()
             return false
         }
-        defaultWriteInFlight = true
+        defaultWritesInFlight += 1
         defaultWriteLock.unlock()
         let semaphore = DispatchSemaphore(value: 0)
         let box = BoolBox()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             defer {
                 self?.defaultWriteLock.lock()
-                self?.defaultWriteInFlight = false
+                if let self, self.defaultWritesInFlight > 0 {
+                    self.defaultWritesInFlight -= 1
+                }
                 self?.defaultWriteLock.unlock()
                 semaphore.signal()
             }
@@ -353,18 +365,20 @@ final class CoreAudioManager {
 
     func boundedSetNominalSampleRate(_ rate: Double, for device: AudioDeviceInfo, timeout: TimeInterval = 2) -> Bool {
         rateWriteLock.lock()
-        guard !rateWriteInFlight else {
+        guard rateWritesInFlight < maxTimedOutWorkers else {
             rateWriteLock.unlock()
             return false
         }
-        rateWriteInFlight = true
+        rateWritesInFlight += 1
         rateWriteLock.unlock()
         let semaphore = DispatchSemaphore(value: 0)
         let box = BoolBox()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             defer {
                 self?.rateWriteLock.lock()
-                self?.rateWriteInFlight = false
+                if let self, self.rateWritesInFlight > 0 {
+                    self.rateWritesInFlight -= 1
+                }
                 self?.rateWriteLock.unlock()
                 semaphore.signal()
             }
