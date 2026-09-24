@@ -82,6 +82,10 @@ cd DisplayAudioFix
 ./install.sh
 ```
 
+For a Finder-based one-click deployment, double-click `install.command` in the
+cloned folder. It opens Terminal, builds the release binary, and asks for the
+same macOS administrator authorization as `install.sh`.
+
 `install.sh` is committed as executable, builds the release binary, asks for
 administrator authorization, installs the system LaunchDaemon, and starts it.
 No separate `chmod`, manual file copy, or background terminal is needed. Run
