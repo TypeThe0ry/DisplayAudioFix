@@ -94,6 +94,9 @@ func commandStatus() {
     Health:
       \(health)
 
+    Health scope:
+      CoreAudio digital transport only; physical sink output is not measurable by macOS
+
     Daemon:
       \(daemonStatus())
 
