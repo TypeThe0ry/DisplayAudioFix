@@ -92,7 +92,11 @@ final class HealthChecker {
         )
         guard status == noErr else { return classify(status) }
 
-        let duration = audible ? 0.20 : 0.08
+        // The periodic probe is deliberately silent and short. The manual
+        // --audible probe is a listening test, so keep the tone long enough
+        // to hear after a display reconnect instead of treating a 200 ms
+        // blip as proof of acoustic output.
+        let duration = audible ? 0.80 : 0.08
         let frames = max(256, Int(sampleRate * duration))
         let byteCount = UInt32(frames * 4)
         for _ in 0..<2 {
@@ -122,7 +126,7 @@ final class HealthChecker {
 
     private func fillTone(buffer: AudioQueueBufferRef, frames: Int, channels: Int, sampleRate: Double) {
         let samples = buffer.pointee.mAudioData.assumingMemoryBound(to: Int16.self)
-        let amplitude = Double(Int16.max) * 0.08
+        let amplitude = Double(Int16.max) * 0.20
         for frame in 0..<frames {
             let value = Int16(sin(2.0 * .pi * 880.0 * Double(frame) / sampleRate) * amplitude)
             for channel in 0..<channels {

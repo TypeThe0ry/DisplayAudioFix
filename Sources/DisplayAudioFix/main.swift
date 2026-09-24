@@ -88,6 +88,9 @@ func commandStatus() {
     Sample rate:
       \(current.map { String(format: "%.0f Hz", $0.sampleRate) } ?? "unknown")
 
+    Output path:
+      \(current?.isDisplayAudio == true ? "DisplayPort digital stream; final volume is controlled by the monitor/headphone sink" : "CoreAudio software-controlled output")
+
     Health:
       \(health)
 
@@ -126,6 +129,7 @@ func commandDevices() {
           Alive: \(boolText(device.isAlive))
           Running: \(boolText(device.isRunning))
           Output channels: \(device.outputChannels)
+        \(device.isDisplayAudio ? "  Volume: controlled by the display/headphone sink (macOS scalar/mute is unavailable)" : "")
         """)
     }
 }
@@ -136,7 +140,7 @@ func commandTest(audible: Bool) -> Int32 {
         stableUID: stateStore.load().preferredDeviceUID,
         timeout: 2
     ) ?? audio.boundedDefaultOutputDevice(timeout: 2)
-    print("Testing \(target?.name ?? config.preferredDeviceName)\(audible ? " with a quiet 880 Hz tone" : " with silence")...")
+    print("Testing \(target?.name ?? config.preferredDeviceName)\(audible ? " with a 0.8s 880 Hz listening tone" : " with silence")...")
     let result = checker.test(device: target, timeout: config.healthCheckTimeoutSeconds, audible: audible)
     print(result)
     return result == .healthy ? 0 : 1

@@ -4,6 +4,18 @@
 
 It was built for macOS 27.0 (26A428) and the preferred `LS24A600U` output. It discovers devices by name and re-reads their UID after a CoreAudio restart; no monitor UUID is hardcoded.
 
+### Important: the LS24A600U has no built-in speakers
+
+Samsung's specifications for the S60UA/`LS24A600U` list **Speaker: No** and
+**Headphone: Yes**. The DisplayPort endpoint is therefore a digital audio
+stream delivered to the monitor's headphone jack (or to another downstream
+audio sink); it cannot make the monitor itself produce sound. After a
+reconnect, connect powered speakers or headphones to that jack and check the
+monitor's OSD input/volume/mute state. macOS reports no scalar volume or mute
+property for this DisplayPort endpoint, so the normal macOS volume slider may
+show `missing value` even while the stream is healthy. See Samsung's official
+[S60UA specifications](https://www.samsung.com/ie/monitors/high-resolution/s60ua-24-24-inch-ips-uhd-4k-ls24a600ucuxxu/).
+
 ## Problem And Root Cause
 
 On the affected macOS 27.0 system, `LS24A600U` remained visible in `system_profiler` and CoreAudio with two output channels, `Alive: yes`, and a 48 kHz DisplayPort format. Enumeration therefore looked normal, but a real `AudioQueue` playback probe failed with `TIMELINE_TIMEOUT` / `AudioQueueStart failed ('stop')`.
@@ -66,11 +78,16 @@ swift build -c release
 .build/release/displayaudiofix test
 ```
 
-`test` sends silence. To verify routing with a quiet 880 Hz tone:
+`test` sends silence. To perform a manual listening test with a 0.8-second
+880 Hz tone:
 
 ```sh
 .build/release/displayaudiofix test --audible
 ```
+
+`HEALTHY` means CoreAudio started the queue and completed an output buffer. It
+proves the digital transport, not the presence of a built-in monitor speaker
+or the volume/mute state of an external sink.
 
 ## Install
 
