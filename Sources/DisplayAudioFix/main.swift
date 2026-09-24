@@ -57,7 +57,12 @@ func todayKey() -> String {
 }
 
 func commandStatus() {
-    let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2)
+    let state = stateStore.load()
+    let preferred = audio.boundedPreferredDevice(
+        named: config.preferredDeviceName,
+        stableUID: state.preferredDeviceUID,
+        timeout: 2
+    )
     let current = audio.boundedDefaultOutputDevice(timeout: 2)
     let health: HealthStatus
     if let preferred {
@@ -67,7 +72,6 @@ func commandStatus() {
     }
     let version = ProcessRunner.run("/usr/bin/sw_vers", ["-productVersion"]).output.trimmingCharacters(in: .whitespacesAndNewlines)
     let build = ProcessRunner.run("/usr/bin/sw_vers", ["-buildVersion"]).output.trimmingCharacters(in: .whitespacesAndNewlines)
-    let state = stateStore.load()
     print("""
     DisplayAudioFix
     macOS: \(version) (\(build))
@@ -127,7 +131,11 @@ func commandDevices() {
 }
 
 func commandTest(audible: Bool) -> Int32 {
-    let target = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2) ?? audio.boundedDefaultOutputDevice(timeout: 2)
+    let target = audio.boundedPreferredDevice(
+        named: config.preferredDeviceName,
+        stableUID: stateStore.load().preferredDeviceUID,
+        timeout: 2
+    ) ?? audio.boundedDefaultOutputDevice(timeout: 2)
     print("Testing \(target?.name ?? config.preferredDeviceName)\(audible ? " with a quiet 880 Hz tone" : " with silence")...")
     let result = checker.test(device: target, timeout: config.healthCheckTimeoutSeconds, audible: audible)
     print(result)
@@ -135,7 +143,11 @@ func commandTest(audible: Bool) -> Int32 {
 }
 
 func commandRestore() -> Int32 {
-    guard let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2) else {
+    guard let preferred = audio.boundedPreferredDevice(
+        named: config.preferredDeviceName,
+        stableUID: stateStore.load().preferredDeviceUID,
+        timeout: 2
+    ) else {
         fputs("preferred output is not currently enumerated\n", stderr)
         return 1
     }
@@ -201,7 +213,7 @@ case "restore": exit(commandRestore())
 case "set-rate": commandSetRate(arguments.dropFirst().first)
 case "repair": commandRepair()
 case "watch":
-    let watcher = Watcher(audio: audio, checker: checker, recovery: recovery, config: config)
+    let watcher = Watcher(audio: audio, checker: checker, recovery: recovery, config: config, stateStore: stateStore)
     watcher.run()
 case "logs": commandLogs(follow: arguments.contains("--follow"))
 case "install":

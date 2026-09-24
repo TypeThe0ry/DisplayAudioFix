@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final class RecoveryManager {
@@ -52,7 +53,14 @@ final class RecoveryManager {
             inProgress = true
             lock.unlock()
         }
+        guard let sharedLock = acquireSharedRecoveryLock() else {
+            lock.lock(); inProgress = false; lock.unlock()
+            logger.log("recovery skipped: another DisplayAudioFix repair is already running")
+            return false
+        }
         defer {
+            flock(sharedLock, LOCK_UN)
+            close(sharedLock)
             lock.lock(); inProgress = false; lock.unlock()
         }
         recordAttempt()
@@ -71,8 +79,18 @@ final class RecoveryManager {
         }
 
         logger.log("recovery stage 2: locating preferred output \(config.preferredDeviceName)")
-        let preferredBefore = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 2)
-        let stableUID = preferredBefore?.uid
+        let knownUID = stateStore.load().preferredDeviceUID
+        let preferredBefore = audio.boundedPreferredDevice(
+            named: config.preferredDeviceName,
+            stableUID: knownUID,
+            timeout: 2
+        )
+        let stableUID = preferredBefore?.uid ?? knownUID
+        if let stableUID, !stableUID.isEmpty {
+            var state = stateStore.load()
+            state.preferredDeviceUID = stableUID.lowercased()
+            stateStore.save(state)
+        }
         if preferredBefore == nil {
             // A transiently unqueryable endpoint is exactly what a wedged HAL
             // can look like. Do not abort before restarting coreaudiod.
@@ -84,14 +102,13 @@ final class RecoveryManager {
         logger.log("recovery stage 3: selecting built-in fallback when available")
         let fallback = audio.boundedBuiltInFallback(timeout: 2)
         if let fallback {
-            do {
-                try audio.setDefaultOutput(fallback)
+            if audio.boundedSetDefaultOutput(fallback, timeout: 2) {
                 logger.log("switching temporary output to \(fallback.name)")
-            } catch {
+            } else {
                 // The fallback switch can fail for the same reason enumeration
                 // failed. Still restart coreaudiod and retry the fallback after
                 // it has rebuilt its device graph.
-                logger.log("could not select fallback before CoreAudio reset: \(error); continuing")
+                logger.log("could not select fallback before CoreAudio reset; continuing")
             }
         } else {
             logger.log("built-in output is not enumerable yet; continuing with CoreAudio reset")
@@ -133,10 +150,8 @@ final class RecoveryManager {
         logger.log("\(restored.name) rediscovered")
 
         logger.log("recovery stage 6: restoring \(restored.name) as default and system output")
-        do {
-            try audio.setDefaultOutput(restored)
-        } catch {
-            logger.log("failed to restore preferred output: \(error); leaving built-in output selected")
+        guard audio.boundedSetDefaultOutput(restored, timeout: 2) else {
+            logger.log("failed to restore preferred output within timeout; leaving built-in output selected")
             selectFreshFallback(named: fallback?.name)
             return false
         }
@@ -181,20 +196,42 @@ final class RecoveryManager {
 
     private func stopBetterDisplayForRecovery() -> BetterDisplaySession? {
         let found = ProcessRunner.run("/usr/bin/pgrep", ["-x", "BetterDisplay"])
-        guard let pid = found.output
+        let pids = found.output
             .split(whereSeparator: \.isNewline)
             .compactMap({ Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
-            .first else { return nil }
-        let uidOutput = ProcessRunner.run("/bin/ps", ["-o", "uid=", "-p", String(pid)]).output
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !uidOutput.isEmpty, uidOutput != "0" else { return nil }
-        let terminated = ProcessRunner.run("/bin/kill", ["-TERM", String(pid)]).status == 0
-        guard terminated else {
+        guard !pids.isEmpty else { return nil }
+        var sessionUID: String?
+        var terminatedPIDs: [Int32] = []
+        for pid in pids {
+            let uidOutput = ProcessRunner.run("/bin/ps", ["-o", "uid=", "-p", String(pid)]).output
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !uidOutput.isEmpty, uidOutput != "0" else { continue }
+            sessionUID = sessionUID ?? uidOutput
+            if ProcessRunner.run("/bin/kill", ["-TERM", String(pid)]).status == 0 {
+                terminatedPIDs.append(pid)
+            }
+        }
+        guard let uid = sessionUID, !terminatedPIDs.isEmpty else {
             logger.log("BetterDisplay was detected but could not be stopped; continuing without app restart")
             return nil
         }
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let stillRunning = terminatedPIDs.contains {
+                ProcessRunner.run("/bin/kill", ["-0", String($0)]).status == 0
+            }
+            if !stillRunning { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        let stillRunning = terminatedPIDs.contains {
+            ProcessRunner.run("/bin/kill", ["-0", String($0)]).status == 0
+        }
+        guard !stillRunning else {
+            logger.log("BetterDisplay did not exit within 5 seconds; continuing without relaunch")
+            return nil
+        }
         logger.log("paused BetterDisplay before CoreAudio recovery")
-        return BetterDisplaySession(uid: uidOutput)
+        return BetterDisplaySession(uid: uid)
     }
 
     private func relaunchBetterDisplay(for session: BetterDisplaySession) {
@@ -215,17 +252,29 @@ final class RecoveryManager {
         // display settings. Restore the original rate before probing playback.
         let original = device.sampleRate > 0 ? device.sampleRate : 48_000
         let alternate: Double = abs(original - 44_100) < 1 ? 48_000.0 : 44_100.0
-        do {
-            try audio.setNominalSampleRate(alternate, for: device)
+        if audio.boundedSetNominalSampleRate(alternate, for: device, timeout: 2) {
             Thread.sleep(forTimeInterval: 0.5)
-            try audio.setNominalSampleRate(original, for: device)
+            guard audio.boundedSetNominalSampleRate(original, for: device, timeout: 2) else {
+                logger.log("sample-rate renegotiation restore timed out; continuing with playback probe")
+                return
+            }
             Thread.sleep(forTimeInterval: 0.5)
             let alternateText = String(format: "%.0f", alternate)
             let originalText = String(format: "%.0f", original)
             logger.log("sample-rate renegotiation completed (\(alternateText) -> \(originalText) Hz)")
-        } catch {
-            logger.log("sample-rate renegotiation unavailable: \(error); continuing with playback probe")
+        } else {
+            logger.log("sample-rate renegotiation unavailable; continuing with playback probe")
         }
+    }
+
+    private func acquireSharedRecoveryLock() -> Int32? {
+        let descriptor = open("/tmp/com.displayaudiofix.recovery.lock", O_CREAT | O_RDWR, 0o666)
+        guard descriptor >= 0 else { return nil }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            close(descriptor)
+            return nil
+        }
+        return descriptor
     }
 
     private func recordAttempt() {

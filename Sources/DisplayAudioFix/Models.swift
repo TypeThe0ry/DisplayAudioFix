@@ -111,4 +111,7 @@ struct PersistentState: Codable {
     var lastRecovery: Date?
     var recoveryTimestamps: [Date] = []
     var recoveryCountByDay: [String: Int] = [:]
+    // The DisplayPort UID survives a CoreAudio restart even when a full HAL
+    // device enumeration is temporarily blocked by another endpoint.
+    var preferredDeviceUID: String?
 }

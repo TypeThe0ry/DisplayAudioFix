@@ -7,8 +7,10 @@ final class Watcher {
     private let recovery: RecoveryManager
     private let config: Configuration
     private let logger = AppLogger.shared
+    private let stateStore: StateStore
     private let workQueue = DispatchQueue(label: "com.displayaudiofix.recovery")
     private let streamBufferLock = NSLock()
+    private let preferredUIDLock = NSLock()
     private var streamBuffer = ""
     private var logProcess: Process?
     private var powerMonitor: PowerMonitor?
@@ -21,12 +23,18 @@ final class Watcher {
     // CoreAudio can emit several lines for one failed start. Coalesce that burst
     // while leaving the periodic probe responsible for the next retry.
     private var lastLogRecoveryAt = Date.distantPast
+    // Keep the last known endpoint identity even while CoreAudio temporarily
+    // reports an empty device list. UID-only coreaudiod errors must still wake
+    // the recovery path during that gap.
+    private var lastPreferredUID: String?
 
-    init(audio: CoreAudioManager, checker: HealthChecker, recovery: RecoveryManager, config: Configuration) {
+    init(audio: CoreAudioManager, checker: HealthChecker, recovery: RecoveryManager, config: Configuration, stateStore: StateStore) {
         self.audio = audio
         self.checker = checker
         self.recovery = recovery
         self.config = config
+        self.stateStore = stateStore
+        self.lastPreferredUID = stateStore.load().preferredDeviceUID
     }
 
     func run() -> Never {
@@ -58,6 +66,9 @@ final class Watcher {
     }
 
     private func startUnifiedLogStream() {
+        if let current = logProcess, current.isRunning {
+            return
+        }
         let predicate = #"process == "coreaudiod" AND (eventMessage CONTAINS[c] "could not establish a timeline" OR eventMessage CONTAINS[c] "1937010544" OR eventMessage CONTAINS[c] "StartIOThread" OR eventMessage CONTAINS[c] "is not running")"#
         let process = Process()
         let pipe = Pipe()
@@ -71,6 +82,9 @@ final class Watcher {
             self?.consumeLogText(text)
         }
         process.terminationHandler = { [weak self] process in
+            if self?.logProcess === process {
+                self?.logProcess = nil
+            }
             self?.logger.log("unified log stream exited with status \(process.terminationStatus); restarting in 5 seconds")
             DispatchQueue.global().asyncAfter(deadline: .now() + 5) { self?.startUnifiedLogStream() }
         }
@@ -109,6 +123,9 @@ final class Watcher {
         // context. That transition is not a failure; treating it as one can
         // restart coreaudiod in the middle of BetterDisplay's re-enumeration.
         guard hardTimelineFailure || deviceStopped || lower.contains("1937010544") || failedStart else { return }
+        if let uid = observedUID(in: line) {
+            rememberPreferredUID(uid)
+        }
         guard shouldTreatAsDisplayFailure(logLine: lower) else {
             return
         }
@@ -124,11 +141,15 @@ final class Watcher {
 
     private func shouldTreatAsDisplayFailure(logLine: String) -> Bool {
         let current = audio.boundedDefaultOutputDevice(timeout: 1.5)
-        let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 1.5)
+        let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: preferredUID(), timeout: 1.5)
+        if let preferred, !preferred.uid.isEmpty {
+            rememberPreferredUID(preferred.uid)
+        }
         if let current, current.isDisplayAudio { return true }
         if let current, current.name.caseInsensitiveCompare(config.preferredDeviceName) == .orderedSame { return true }
         if let preferred, preferred.isDefaultOutput || preferred.isSystemOutput { return true }
         if let preferred, !preferred.uid.isEmpty && logLine.contains(preferred.uid.lowercased()) { return true }
+        if let uid = preferredUID(), logLine.contains(uid) { return true }
         return logLine.contains(config.preferredDeviceName.lowercased())
     }
 
@@ -155,10 +176,20 @@ final class Watcher {
         // Keep probing the preferred display even after a failed recovery has
         // selected the built-in fallback. Otherwise the fallback becomes a
         // permanent stop condition and LS24A600U is never retried.
-        guard let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, timeout: 1.5) else {
+        guard let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: preferredUID(), timeout: 1.5) else {
             logger.log("\(reason): preferred device missing or CoreAudio enumeration timed out", alsoPrint: false)
-            scheduleRetry(reason: "\(reason) could not enumerate preferred device")
+            // A missing endpoint is itself a recovery condition. Waiting for a
+            // future log line can deadlock forever when coreaudiod has stopped
+            // publishing device events, so run the staged reset directly.
+            if config.continuousRecovery {
+                performRecovery(trigger: "\(reason) could not enumerate preferred device")
+            } else {
+                scheduleRetry(reason: "preferred device unavailable")
+            }
             return
+        }
+        if !preferred.uid.isEmpty {
+            rememberPreferredUID(preferred.uid)
         }
         let result = checker.test(device: preferred, timeout: config.healthCheckTimeoutSeconds, audible: false)
         if result == .healthy {
@@ -168,7 +199,9 @@ final class Watcher {
             } else {
                 logger.log("\(reason): preferred device is healthy but not default; restoring it")
                 do {
-                    try audio.setDefaultOutput(preferred)
+                    guard audio.boundedSetDefaultOutput(preferred, timeout: 2) else {
+                        throw CoreAudioError.property("set default audio device", -1)
+                    }
                     logger.log("\(reason): preferred device restored as default", alsoPrint: false)
                 } catch {
                     logger.log("\(reason): healthy preferred device could not become default: \(error)")
@@ -193,10 +226,39 @@ final class Watcher {
     private func scheduleRetry(reason: String) {
         guard !retryScheduled else { return }
         retryScheduled = true
+        let compactReason = reason.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? "recovery retry"
         workQueue.asyncAfter(deadline: .now() + 15) { [weak self] in
             guard let self else { return }
             self.retryScheduled = false
-            self.healthCheckIfUseful(reason: "retry after \(reason)")
+            self.healthCheckIfUseful(reason: "retry after \(compactReason)")
         }
+    }
+
+    private func preferredUID() -> String? {
+        preferredUIDLock.lock(); defer { preferredUIDLock.unlock() }
+        return lastPreferredUID
+    }
+
+    private func rememberPreferredUID(_ uid: String) {
+        let normalized = uid.lowercased()
+        guard !normalized.isEmpty else { return }
+        preferredUIDLock.lock()
+        let changed = lastPreferredUID != normalized
+        lastPreferredUID = normalized
+        preferredUIDLock.unlock()
+        guard changed else { return }
+        var state = stateStore.load()
+        state.preferredDeviceUID = normalized
+        stateStore.save(state)
+    }
+
+    private func observedUID(in line: String) -> String? {
+        for token in line.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ")" || $0 == "," || $0 == ":" }) {
+            let value = String(token).trimmingCharacters(in: .punctuationCharacters)
+            if let uuid = UUID(uuidString: value) {
+                return uuid.uuidString.lowercased()
+            }
+        }
+        return nil
     }
 }

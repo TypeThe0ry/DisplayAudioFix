@@ -5,6 +5,14 @@ private final class DeviceListBox {
     var value: [AudioDeviceInfo] = []
 }
 
+private final class DeviceInfoBox {
+    var value: AudioDeviceInfo?
+}
+
+private final class BoolBox {
+    var value = false
+}
+
 enum CoreAudioError: Error, CustomStringConvertible {
     case property(String, OSStatus)
     case noOutputDevice(String)
@@ -19,6 +27,14 @@ enum CoreAudioError: Error, CustomStringConvertible {
 
 final class CoreAudioManager {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
+    private let snapshotQueryLock = NSLock()
+    private var snapshotQueryInFlight = false
+    private let uidQueryLock = NSLock()
+    private var uidQueryInFlight = false
+    private let defaultWriteLock = NSLock()
+    private var defaultWriteInFlight = false
+    private let rateWriteLock = NSLock()
+    private var rateWriteInFlight = false
 
     func devices() -> [AudioDeviceInfo] {
         devicesUnbounded()
@@ -28,11 +44,23 @@ final class CoreAudioManager {
     /// wedged during a display hot-switch. Keep watcher/CLI control paths
     /// bounded so one stuck HAL call cannot permanently stop recovery.
     func boundedDevices(timeout: TimeInterval = 2) -> [AudioDeviceInfo]? {
+        snapshotQueryLock.lock()
+        guard !snapshotQueryInFlight else {
+            snapshotQueryLock.unlock()
+            return nil
+        }
+        snapshotQueryInFlight = true
+        snapshotQueryLock.unlock()
         let semaphore = DispatchSemaphore(value: 0)
         let box = DeviceListBox()
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer {
+                self?.snapshotQueryLock.lock()
+                self?.snapshotQueryInFlight = false
+                self?.snapshotQueryLock.unlock()
+                semaphore.signal()
+            }
             box.value = self?.devicesUnbounded() ?? []
-            semaphore.signal()
         }
         guard semaphore.wait(timeout: .now() + max(timeout, 0.1)) == .success else {
             return nil
@@ -54,24 +82,26 @@ final class CoreAudioManager {
         var ids = Array(repeating: AudioDeviceID(0), count: count)
         guard AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &ids) == noErr else { return [] }
 
-        return ids.compactMap { id in
-            let channelCount = outputChannelCount(id)
-            guard channelCount > 0 else { return nil }
-            let transportValue = uint32Property(id, kAudioDevicePropertyTransportType) ?? 0
-            return AudioDeviceInfo(
-                id: id,
-                name: stringProperty(id, kAudioObjectPropertyName) ?? "Unknown",
-                uid: stringProperty(id, kAudioDevicePropertyDeviceUID) ?? "",
-                transportRawValue: transportValue,
-                transport: transportName(transportValue),
-                sampleRate: float64Property(id, kAudioDevicePropertyNominalSampleRate) ?? 0,
-                isDefaultOutput: id == defaultID,
-                isSystemOutput: id == systemID,
-                isAlive: uint32Property(id, kAudioDevicePropertyDeviceIsAlive).map { $0 != 0 },
-                isRunning: uint32Property(id, kAudioDevicePropertyDeviceIsRunningSomewhere).map { $0 != 0 },
-                outputChannels: channelCount
-            )
-        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return ids.compactMap { deviceInfoUnbounded($0, defaultID: defaultID, systemID: systemID) }
+    }
+
+    private func deviceInfoUnbounded(_ id: AudioDeviceID, defaultID: AudioDeviceID, systemID: AudioDeviceID) -> AudioDeviceInfo? {
+        let channelCount = outputChannelCount(id)
+        guard channelCount > 0 else { return nil }
+        let transportValue = uint32Property(id, kAudioDevicePropertyTransportType) ?? 0
+        return AudioDeviceInfo(
+            id: id,
+            name: stringProperty(id, kAudioObjectPropertyName) ?? "Unknown",
+            uid: stringProperty(id, kAudioDevicePropertyDeviceUID) ?? "",
+            transportRawValue: transportValue,
+            transport: transportName(transportValue),
+            sampleRate: float64Property(id, kAudioDevicePropertyNominalSampleRate) ?? 0,
+            isDefaultOutput: id == defaultID,
+            isSystemOutput: id == systemID,
+            isAlive: uint32Property(id, kAudioDevicePropertyDeviceIsAlive).map { $0 != 0 },
+            isRunning: uint32Property(id, kAudioDevicePropertyDeviceIsRunningSomewhere).map { $0 != 0 },
+            outputChannels: channelCount
+        )
     }
 
     func defaultOutputDevice() -> AudioDeviceInfo? {
@@ -89,19 +119,95 @@ final class CoreAudioManager {
     }
 
     func boundedPreferredDevice(named name: String, stableUID: String? = nil, timeout: TimeInterval = 2) -> AudioDeviceInfo? {
+        // A wedged unrelated endpoint can block the full device-list walk even
+        // after LS24A600U has reappeared. Once a UID is known, ask HAL for that
+        // device directly before falling back to a full snapshot.
+        if let stableUID, !stableUID.isEmpty,
+           let byUID = boundedDeviceForUID(stableUID, name: name, timeout: timeout) {
+            return byUID
+        }
         guard let current = boundedDevices(timeout: timeout) else { return nil }
         return findPreferred(in: current, named: name, stableUID: stableUID)
     }
 
     private func findPreferred(in current: [AudioDeviceInfo], named name: String, stableUID: String? = nil) -> AudioDeviceInfo? {
-        if let exact = current.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
-            return exact
-        }
         if let stableUID, !stableUID.isEmpty,
-           let byUID = current.first(where: { $0.uid == stableUID }) {
+           let byUID = current.first(where: {
+               !$0.uid.isEmpty && $0.uid.caseInsensitiveCompare(stableUID) == .orderedSame
+           }) {
             return byUID
         }
+        if let exact = current.first(where: {
+            $0.name.caseInsensitiveCompare(name) == .orderedSame && $0.outputChannels > 0
+        }) {
+            return exact
+        }
         return current.first(where: { $0.name.localizedCaseInsensitiveContains(name) })
+    }
+
+    private func boundedDeviceForUID(_ uid: String, name: String, timeout: TimeInterval) -> AudioDeviceInfo? {
+        uidQueryLock.lock()
+        guard !uidQueryInFlight else { uidQueryLock.unlock(); return nil }
+        uidQueryInFlight = true
+        uidQueryLock.unlock()
+
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = DeviceInfoBox()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer {
+                self?.uidQueryLock.lock()
+                self?.uidQueryInFlight = false
+                self?.uidQueryLock.unlock()
+                semaphore.signal()
+            }
+            guard let self, let id = self.deviceID(forUID: uid), id != AudioDeviceID(kAudioObjectUnknown) else { return }
+            // Do not read a second property here. A stale endpoint can make
+            // any per-device property call block forever even though the UID
+            // translation succeeded. The AudioQueue probe below is the
+            // authoritative liveness check, so return a conservative record
+            // and let recovery validate it instead of wedging this worker.
+            box.value = AudioDeviceInfo(
+                id: id,
+                name: name,
+                uid: uid,
+                transportRawValue: kAudioDeviceTransportTypeDisplayPort,
+                transport: "DisplayPort",
+                sampleRate: 48_000,
+                isDefaultOutput: false,
+                isSystemOutput: false,
+                isAlive: true,
+                isRunning: nil,
+                outputChannels: 2
+            )
+        }
+        guard semaphore.wait(timeout: .now() + max(timeout, 0.1)) == .success else {
+            return nil
+        }
+        return box.value
+    }
+
+    private func deviceID(forUID uid: String) -> AudioDeviceID? {
+        let inputUID: CFString = uid as CFString
+        var uidReference: Unmanaged<CFString>? = Unmanaged.passUnretained(inputUID)
+        var outputID = AudioDeviceID(kAudioObjectUnknown)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDeviceForUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = withUnsafeMutablePointer(to: &uidReference) { inputPointer in
+            withUnsafeMutablePointer(to: &outputID) { outputPointer in
+                var translation = AudioValueTranslation(
+                    mInputData: UnsafeMutableRawPointer(inputPointer),
+                    mInputDataSize: UInt32(MemoryLayout<Unmanaged<CFString>?>.size),
+                    mOutputData: UnsafeMutableRawPointer(outputPointer),
+                    mOutputDataSize: UInt32(MemoryLayout<AudioDeviceID>.size)
+                )
+                var size = UInt32(MemoryLayout<AudioValueTranslation>.size)
+                return AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &translation)
+            }
+        }
+        return status == noErr && outputID != AudioDeviceID(kAudioObjectUnknown) ? outputID : nil
     }
 
     func builtInFallback() -> AudioDeviceInfo? {
@@ -125,6 +231,34 @@ final class CoreAudioManager {
         try setDefaultDevice(device.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
     }
 
+    /// Bound writes as well as reads. During a display reconnect CoreAudio can
+    /// block a setter while the endpoint is being torn down; recovery must
+    /// still reach the coreaudiod restart stage instead of waiting forever.
+    func boundedSetDefaultOutput(_ device: AudioDeviceInfo, timeout: TimeInterval = 2) -> Bool {
+        defaultWriteLock.lock()
+        guard !defaultWriteInFlight else {
+            defaultWriteLock.unlock()
+            return false
+        }
+        defaultWriteInFlight = true
+        defaultWriteLock.unlock()
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = BoolBox()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer {
+                self?.defaultWriteLock.lock()
+                self?.defaultWriteInFlight = false
+                self?.defaultWriteLock.unlock()
+                semaphore.signal()
+            }
+            if let self {
+                box.value = (try? self.setDefaultOutput(device)) != nil
+            }
+        }
+        guard semaphore.wait(timeout: .now() + max(timeout, 0.1)) == .success else { return false }
+        return box.value
+    }
+
     func setNominalSampleRate(_ rate: Double, for device: AudioDeviceInfo) throws {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
@@ -139,6 +273,31 @@ final class CoreAudioManager {
         guard status == noErr else {
             throw CoreAudioError.property("set nominal sample rate", status)
         }
+    }
+
+    func boundedSetNominalSampleRate(_ rate: Double, for device: AudioDeviceInfo, timeout: TimeInterval = 2) -> Bool {
+        rateWriteLock.lock()
+        guard !rateWriteInFlight else {
+            rateWriteLock.unlock()
+            return false
+        }
+        rateWriteInFlight = true
+        rateWriteLock.unlock()
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = BoolBox()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer {
+                self?.rateWriteLock.lock()
+                self?.rateWriteInFlight = false
+                self?.rateWriteLock.unlock()
+                semaphore.signal()
+            }
+            if let self {
+                box.value = (try? self.setNominalSampleRate(rate, for: device)) != nil
+            }
+        }
+        guard semaphore.wait(timeout: .now() + max(timeout, 0.1)) == .success else { return false }
+        return box.value
     }
 
     private func defaultDevice(selector: AudioObjectPropertySelector) -> AudioDeviceID {
