@@ -185,6 +185,14 @@ final class CoreAudioManager {
            let byUID = current.first(where: {
                !$0.uid.isEmpty && $0.uid.caseInsensitiveCompare(stableUID) == .orderedSame
            }) {
+            // A built-in endpoint may only be the temporary fallback from a
+            // previous disconnect. If an external physical output is now
+            // connected, resume external audio instead of locking onto the
+            // fallback forever.
+            if followActiveOutput, byUID.isBuiltInOutput,
+               let external = physicalOutputs.first(where: { !$0.isBuiltInOutput }) {
+                return external
+            }
             return byUID
         }
         if let exact = current.first(where: {
