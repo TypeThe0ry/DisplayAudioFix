@@ -68,12 +68,34 @@ final class RecoveryManager {
         recordAttempt()
         logger.log("recovery started (trigger: \(trigger))")
 
+        let initialState = stateStore.load()
+        var activeDeviceName = initialState.activeDeviceName ?? config.preferredDeviceName
+        let knownUID = initialState.preferredDeviceUID
+        // Keep the old behavior for an existing installation whose state file
+        // predates generic output tracking: LS24A600U was a display endpoint,
+        // so BetterDisplay still needs to be quiesced before the first repair.
+        var activeDeviceIsDisplayAudio = initialState.activeDeviceIsDisplayAudio ?? true
+        let initialTarget = audio.boundedPreferredDevice(
+            named: activeDeviceName,
+            stableUID: knownUID,
+            followActiveOutput: config.followActiveOutput,
+            timeout: 2
+        )
+        if let initialTarget {
+            activeDeviceName = initialTarget.name
+            activeDeviceIsDisplayAudio = initialTarget.isDisplayAudio
+            rememberActiveTarget(initialTarget)
+        }
+
         // BetterDisplay can retain an AudioQueue/IO context across a display
-        // reconnect. Quiesce it before making CoreAudio property calls: on the
-        // affected failure path those calls can time out while its stale client
-        // still owns the old DisplayPort I/O context.
-        logger.log("recovery stage 1: pausing BetterDisplay before CoreAudio queries")
-        let betterDisplaySession = stopBetterDisplayForRecovery()
+        // reconnect. Quiesce it only while the active target is a display
+        // endpoint; USB, Bluetooth, built-in, and other speaker outputs do not
+        // need BetterDisplay restarted.
+        let stageOneDescription = activeDeviceIsDisplayAudio
+            ? "pausing BetterDisplay before CoreAudio queries"
+            : "preparing CoreAudio recovery for generic physical output"
+        logger.log("recovery stage 1: \(stageOneDescription)")
+        let betterDisplaySession = activeDeviceIsDisplayAudio ? stopBetterDisplayForRecovery() : nil
         var shouldReassertPreferredAfterBetterDisplay = false
         defer {
             if let betterDisplaySession {
@@ -86,31 +108,40 @@ final class RecoveryManager {
                     // the preferred endpoint once more. The values are read
                     // first so an intentional user mute or volume level is
                     // never overwritten.
-                    reinitializeMonitorAudio(for: betterDisplaySession)
-                    reassertPreferredOutputAfterBetterDisplay()
+                    if activeDeviceIsDisplayAudio {
+                        reinitializeMonitorAudio(for: betterDisplaySession, deviceName: activeDeviceName)
+                    }
+                    reassertPreferredOutputAfterBetterDisplay(deviceName: activeDeviceName)
                 }
             }
         }
 
-        logger.log("recovery stage 2: locating preferred output \(config.preferredDeviceName)")
-        let knownUID = stateStore.load().preferredDeviceUID
+        logger.log("recovery stage 2: locating active physical output \(activeDeviceName)")
         let preferredBefore = audio.boundedPreferredDevice(
-            named: config.preferredDeviceName,
+            named: activeDeviceName,
             stableUID: knownUID,
+            followActiveOutput: config.followActiveOutput,
             timeout: 2
         )
-        let stableUID = preferredBefore?.uid ?? knownUID
+        var stableUID = preferredBefore?.uid ?? knownUID
+        if let preferredBefore {
+            activeDeviceName = preferredBefore.name
+            activeDeviceIsDisplayAudio = preferredBefore.isDisplayAudio
+            rememberActiveTarget(preferredBefore)
+        }
         if let stableUID, !stableUID.isEmpty {
             var state = stateStore.load()
             state.preferredDeviceUID = stableUID.lowercased()
+            state.activeDeviceName = activeDeviceName
+            state.activeDeviceIsDisplayAudio = activeDeviceIsDisplayAudio
             stateStore.save(state)
         }
         if preferredBefore == nil {
             // A transiently unqueryable endpoint is exactly what a wedged HAL
             // can look like. Do not abort before restarting coreaudiod.
-            logger.log("preferred output is not enumerable yet; continuing with CoreAudio reset")
+            logger.log("active physical output is not enumerable yet; continuing with CoreAudio reset")
         } else if preferredBefore?.outputChannels == 0 {
-            logger.log("preferred output currently reports no channels; continuing with CoreAudio reset")
+            logger.log("active physical output currently reports no channels; continuing with CoreAudio reset")
         }
 
         logger.log("recovery stage 3: selecting built-in fallback when available")
@@ -144,8 +175,22 @@ final class RecoveryManager {
         var restored: AudioDeviceInfo?
         var delay: TimeInterval = 0.5
         while Date() < deadline {
-            if let candidate = audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: stableUID, timeout: 1.5),
+            if let candidate = audio.boundedPreferredDevice(
+                named: activeDeviceName,
+                stableUID: stableUID,
+                // The built-in output is deliberately selected as a temporary
+                // fallback before coreaudiod restarts; do not mistake that
+                // fallback for a user switch while waiting for the target.
+                followActiveOutput: false,
+                timeout: 1.5
+            ),
                candidate.outputChannels > 0, candidate.isAlive != false {
+                activeDeviceName = candidate.name
+                activeDeviceIsDisplayAudio = candidate.isDisplayAudio
+                if !candidate.uid.isEmpty {
+                    stableUID = candidate.uid
+                }
+                rememberActiveTarget(candidate)
                 restored = candidate
                 break
             }
@@ -154,9 +199,9 @@ final class RecoveryManager {
         }
         guard let restored else {
             if let fallback {
-                logger.log("preferred output did not reappear within 60 seconds; leaving \(fallback.name) selected")
+                logger.log("active physical output did not reappear within 60 seconds; leaving \(fallback.name) selected")
             } else {
-                logger.log("preferred output did not reappear within 60 seconds; selecting any available built-in output")
+                logger.log("active physical output did not reappear within 60 seconds; selecting any available built-in output")
             }
             selectFreshFallback(named: fallback?.name)
             return false
@@ -165,7 +210,7 @@ final class RecoveryManager {
 
         logger.log("recovery stage 6: restoring \(restored.name) as default and system output")
         guard audio.boundedSetDefaultOutput(restored, timeout: 2) else {
-            logger.log("failed to restore preferred output within timeout; leaving built-in output selected")
+            logger.log("failed to restore active physical output within timeout; leaving built-in output selected")
             selectFreshFallback(named: fallback?.name)
             return false
         }
@@ -174,11 +219,31 @@ final class RecoveryManager {
         renegotiateSampleRate(for: restored)
 
         logger.log("recovery stage 7: running silent playback health check")
-        var result = checker.test(device: audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: stableUID, timeout: 1.5), timeout: config.healthCheckTimeoutSeconds, audible: false)
+        var result = checker.test(
+            device: audio.boundedPreferredDevice(
+                named: activeDeviceName,
+                stableUID: stableUID,
+                followActiveOutput: false,
+                timeout: 1.5
+            ),
+            timeout: config.healthCheckTimeoutSeconds,
+            audible: false
+        )
         if result != .healthy {
             logger.log("post-recovery health check returned \(result); retrying once after 2 seconds")
             Thread.sleep(forTimeInterval: 2)
-            if let fresh = audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: stableUID, timeout: 1.5) {
+            if let fresh = audio.boundedPreferredDevice(
+                named: activeDeviceName,
+                stableUID: stableUID,
+                followActiveOutput: false,
+                timeout: 1.5
+            ) {
+                activeDeviceName = fresh.name
+                activeDeviceIsDisplayAudio = fresh.isDisplayAudio
+                if !fresh.uid.isEmpty {
+                    stableUID = fresh.uid
+                }
+                rememberActiveTarget(fresh)
                 try? audio.setDefaultOutput(fresh)
                 result = checker.test(device: fresh, timeout: config.healthCheckTimeoutSeconds, audible: false)
             } else {
@@ -196,6 +261,13 @@ final class RecoveryManager {
         }
         logger.log("silent health check successful")
         logger.log("recovery completed")
+        var finalState = stateStore.load()
+        finalState.activeDeviceName = activeDeviceName
+        finalState.activeDeviceIsDisplayAudio = activeDeviceIsDisplayAudio
+        if let stableUID, !stableUID.isEmpty {
+            finalState.preferredDeviceUID = stableUID.lowercased()
+        }
+        stateStore.save(finalState)
         shouldReassertPreferredAfterBetterDisplay = true
         return true
     }
@@ -288,41 +360,40 @@ final class RecoveryManager {
         }
     }
 
-    private func reinitializeMonitorAudio(for session: BetterDisplaySession) {
+    private func reinitializeMonitorAudio(for session: BetterDisplaySession, deviceName: String) {
         guard FileManager.default.isExecutableFile(atPath: betterDisplayExecutable) else {
             logger.log("BetterDisplay audio reinitialization skipped: executable not found")
             return
         }
 
         let baseArguments = ["asuser", session.uid, betterDisplayExecutable]
-        guard let muted = readBetterDisplayMuteState(baseArguments: baseArguments) else {
+        guard let muted = readBetterDisplayMuteState(baseArguments: baseArguments, deviceName: deviceName) else {
             logger.log("BetterDisplay audio reinitialization skipped: could not read monitor mute state")
             return
         }
 
-        // A reconnect can leave the monitor's DDC mute bit latched even
-        // though CoreAudio reports a healthy queue. This utility's contract
-        // is to restore audible LS24A600U output, so clear that stale mute
-        // bit during a successful recovery. BetterDisplay maps this command
-        // to the display's DDC mute controller; the following volume write
+        // A reconnect can leave a monitor's DDC mute bit latched even though
+        // CoreAudio reports a healthy queue. Clear that stale mute bit during
+        // a successful display recovery. BetterDisplay maps this command to
+        // the display's DDC mute controller; the following volume write
         // restores the current level instead of changing it.
         if muted {
             logger.log("monitor mute was on after reconnect; clearing stale DDC mute")
         }
 
         let muteWrite = ProcessRunner.run("/bin/launchctl", baseArguments + [
-            "set", "-nameLike=\(config.preferredDeviceName)", "-mute=off"
+            "set", "-nameLike=\(deviceName)", "-mute=off"
         ], timeout: 4)
         guard muteWrite.status == 0 else {
             logger.log("monitor DDC mute reinitialization failed: \(muteWrite.output.trimmingCharacters(in: .whitespacesAndNewlines))")
             return
         }
 
-        if let volume = readBetterDisplayVolume(baseArguments: baseArguments),
+        if let volume = readBetterDisplayVolume(baseArguments: baseArguments, deviceName: deviceName),
            volume >= 0, volume <= 1 {
             let volumeValue = String(format: "%.4f", volume)
             let volumeWrite = ProcessRunner.run("/bin/launchctl", baseArguments + [
-                "set", "-nameLike=\(config.preferredDeviceName)", "-volume=\(volumeValue)"
+                "set", "-nameLike=\(deviceName)", "-volume=\(volumeValue)"
             ], timeout: 4)
             if volumeWrite.status == 0 {
                 logger.log("reinitialized monitor DDC audio path (mute=unmuted, volume=\(volumeValue))")
@@ -334,10 +405,10 @@ final class RecoveryManager {
         }
     }
 
-    private func readBetterDisplayMuteState(baseArguments: [String]) -> Bool? {
+    private func readBetterDisplayMuteState(baseArguments: [String], deviceName: String) -> Bool? {
         for attempt in 0..<3 {
             let result = ProcessRunner.run("/bin/launchctl", baseArguments + [
-                "get", "-nameLike=\(config.preferredDeviceName)", "-mute", "-value"
+                "get", "-nameLike=\(deviceName)", "-mute", "-value"
             ], timeout: 4)
             if result.status == 0 {
                 let value = result.output.lowercased()
@@ -351,10 +422,10 @@ final class RecoveryManager {
         return nil
     }
 
-    private func readBetterDisplayVolume(baseArguments: [String]) -> Double? {
+    private func readBetterDisplayVolume(baseArguments: [String], deviceName: String) -> Double? {
         for attempt in 0..<3 {
             let result = ProcessRunner.run("/bin/launchctl", baseArguments + [
-                "get", "-nameLike=\(config.preferredDeviceName)", "-volume", "-value", "-min", "-max"
+                "get", "-nameLike=\(deviceName)", "-volume", "-value", "-min", "-max"
             ], timeout: 4)
             if result.status == 0 {
                 for line in result.output.split(whereSeparator: \.isNewline) {
@@ -373,11 +444,12 @@ final class RecoveryManager {
         return nil
     }
 
-    private func reassertPreferredOutputAfterBetterDisplay() {
+    private func reassertPreferredOutputAfterBetterDisplay(deviceName: String) {
         let state = stateStore.load()
         guard let preferred = audio.boundedPreferredDevice(
-            named: config.preferredDeviceName,
+            named: deviceName,
             stableUID: state.preferredDeviceUID,
+            followActiveOutput: false,
             timeout: 2
         ) else {
             logger.log("preferred output could not be re-enumerated after BetterDisplay relaunch")
@@ -420,6 +492,16 @@ final class RecoveryManager {
             return nil
         }
         return descriptor
+    }
+
+    private func rememberActiveTarget(_ device: AudioDeviceInfo) {
+        var state = stateStore.load()
+        state.activeDeviceName = device.name
+        state.activeDeviceIsDisplayAudio = device.isDisplayAudio
+        if !device.uid.isEmpty {
+            state.preferredDeviceUID = device.uid.lowercased()
+        }
+        stateStore.save(state)
     }
 
     private func recordAttempt() {

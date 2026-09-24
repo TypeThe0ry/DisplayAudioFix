@@ -3,6 +3,10 @@ import Foundation
 
 struct Configuration: Codable {
     var preferredDeviceName: String = "LS24A600U"
+    /// Follow the currently selected physical output when the user changes
+    /// monitors or speakers. The configured name remains the first-choice
+    /// external fallback for the existing LS24A600U setup.
+    var followActiveOutput: Bool = true
     var healthCheckIntervalSeconds: TimeInterval = 30
     var postWakeDelaySeconds: TimeInterval = 8
     var healthCheckTimeoutSeconds: TimeInterval = 3
@@ -11,7 +15,7 @@ struct Configuration: Codable {
     var recoveryWindowSeconds: TimeInterval = 300
 
     private enum CodingKeys: String, CodingKey {
-        case preferredDeviceName, healthCheckIntervalSeconds, postWakeDelaySeconds
+        case preferredDeviceName, followActiveOutput, healthCheckIntervalSeconds, postWakeDelaySeconds
         case healthCheckTimeoutSeconds, minimumRecoveryCooldownSeconds
         case continuousRecovery, recoveryWindowSeconds
     }
@@ -21,6 +25,7 @@ struct Configuration: Codable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         preferredDeviceName = try container.decodeIfPresent(String.self, forKey: .preferredDeviceName) ?? "LS24A600U"
+        followActiveOutput = try container.decodeIfPresent(Bool.self, forKey: .followActiveOutput) ?? true
         healthCheckIntervalSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .healthCheckIntervalSeconds) ?? 30
         postWakeDelaySeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .postWakeDelaySeconds) ?? 8
         healthCheckTimeoutSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .healthCheckTimeoutSeconds) ?? 3
@@ -75,6 +80,10 @@ struct AudioDeviceInfo {
     var isVirtual: Bool {
         transportRawValue == kAudioDeviceTransportTypeVirtual
     }
+
+    var isPhysicalOutput: Bool {
+        outputChannels > 0 && !isVirtual
+    }
 }
 
 enum HealthStatus: Equatable, CustomStringConvertible {
@@ -111,7 +120,12 @@ struct PersistentState: Codable {
     var lastRecovery: Date?
     var recoveryTimestamps: [Date] = []
     var recoveryCountByDay: [String: Int] = [:]
-    // The DisplayPort UID survives a CoreAudio restart even when a full HAL
+    // The active display UID survives a CoreAudio restart even when a full HAL
     // device enumeration is temporarily blocked by another endpoint.
     var preferredDeviceUID: String?
+    // Name of the display selected after a monitor switch. This lets Better-
+    // Display reinitialize the same physical display instead of always using
+    // the originally configured monitor name.
+    var activeDeviceName: String?
+    var activeDeviceIsDisplayAudio: Bool?
 }

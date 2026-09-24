@@ -27,6 +27,7 @@ final class Watcher {
     // reports an empty device list. UID-only coreaudiod errors must still wake
     // the recovery path during that gap.
     private var lastPreferredUID: String?
+    private var lastPreferredName: String?
 
     init(audio: CoreAudioManager, checker: HealthChecker, recovery: RecoveryManager, config: Configuration, stateStore: StateStore) {
         self.audio = audio
@@ -34,7 +35,9 @@ final class Watcher {
         self.recovery = recovery
         self.config = config
         self.stateStore = stateStore
-        self.lastPreferredUID = stateStore.load().preferredDeviceUID
+        let state = stateStore.load()
+        self.lastPreferredUID = state.preferredDeviceUID
+        self.lastPreferredName = state.activeDeviceName
     }
 
     func run() -> Never {
@@ -42,7 +45,7 @@ final class Watcher {
             logger.log("watch daemon skipped; another DisplayAudioFix watcher is already running")
             exit(0)
         }
-        logger.log("watch daemon started; preferred device: \(config.preferredDeviceName)")
+        logger.log("watch daemon started; preferred device: \(config.preferredDeviceName); active target: \(preferredName()); automatic physical-output switching: \(config.followActiveOutput)")
         startUnifiedLogStream()
         startPeriodicHealthChecks()
         powerMonitor = PowerMonitor { [weak self] in self?.schedulePostWakeCheck() }
@@ -140,17 +143,23 @@ final class Watcher {
     }
 
     private func shouldTreatAsDisplayFailure(logLine: String) -> Bool {
+        let targetName = preferredName()
         let current = audio.boundedDefaultOutputDevice(timeout: 1.5)
-        let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: preferredUID(), timeout: 1.5)
+        let preferred = audio.boundedPreferredDevice(
+            named: targetName,
+            stableUID: preferredUID(),
+            followActiveOutput: config.followActiveOutput,
+            timeout: 1.5
+        )
         if let preferred, !preferred.uid.isEmpty {
-            rememberPreferredUID(preferred.uid)
+            rememberPreferredDevice(preferred)
         }
-        if let current, current.isDisplayAudio { return true }
-        if let current, current.name.caseInsensitiveCompare(config.preferredDeviceName) == .orderedSame { return true }
+        if let current, current.isPhysicalOutput { return true }
+        if let current, current.name.caseInsensitiveCompare(targetName) == .orderedSame { return true }
         if let preferred, preferred.isDefaultOutput || preferred.isSystemOutput { return true }
         if let preferred, !preferred.uid.isEmpty && logLine.contains(preferred.uid.lowercased()) { return true }
         if let uid = preferredUID(), logLine.contains(uid) { return true }
-        return logLine.contains(config.preferredDeviceName.lowercased())
+        return logLine.contains(targetName.lowercased()) || logLine.contains(config.preferredDeviceName.lowercased())
     }
 
     private func startPeriodicHealthChecks() {
@@ -175,8 +184,15 @@ final class Watcher {
     private func healthCheckIfUseful(reason: String) {
         // Keep probing the preferred display even after a failed recovery has
         // selected the built-in fallback. Otherwise the fallback becomes a
-        // permanent stop condition and LS24A600U is never retried.
-        guard let preferred = audio.boundedPreferredDevice(named: config.preferredDeviceName, stableUID: preferredUID(), timeout: 1.5) else {
+        // permanent stop condition and the configured/active physical output
+        // is never retried.
+        let targetName = preferredName()
+        guard let preferred = audio.boundedPreferredDevice(
+            named: targetName,
+            stableUID: preferredUID(),
+            followActiveOutput: config.followActiveOutput,
+            timeout: 1.5
+        ) else {
             logger.log("\(reason): preferred device missing or CoreAudio enumeration timed out", alsoPrint: false)
             // A missing endpoint is itself a recovery condition. Waiting for a
             // future log line can deadlock forever when coreaudiod has stopped
@@ -188,9 +204,7 @@ final class Watcher {
             }
             return
         }
-        if !preferred.uid.isEmpty {
-            rememberPreferredUID(preferred.uid)
-        }
+        rememberPreferredDevice(preferred)
         let result = checker.test(device: preferred, timeout: config.healthCheckTimeoutSeconds, audible: false)
         if result == .healthy {
             retryScheduled = false
@@ -237,6 +251,28 @@ final class Watcher {
     private func preferredUID() -> String? {
         preferredUIDLock.lock(); defer { preferredUIDLock.unlock() }
         return lastPreferredUID
+    }
+
+    private func preferredName() -> String {
+        preferredUIDLock.lock(); defer { preferredUIDLock.unlock() }
+        return lastPreferredName ?? config.preferredDeviceName
+    }
+
+    private func rememberPreferredDevice(_ device: AudioDeviceInfo) {
+        let normalizedUID = device.uid.lowercased()
+        preferredUIDLock.lock()
+        let changed = lastPreferredUID != normalizedUID || lastPreferredName != device.name
+        lastPreferredUID = normalizedUID.isEmpty ? lastPreferredUID : normalizedUID
+        lastPreferredName = device.name
+        preferredUIDLock.unlock()
+        guard changed else { return }
+        var state = stateStore.load()
+        if !normalizedUID.isEmpty {
+            state.preferredDeviceUID = normalizedUID
+        }
+        state.activeDeviceName = device.name
+        state.activeDeviceIsDisplayAudio = device.isDisplayAudio
+        stateStore.save(state)
     }
 
     private func rememberPreferredUID(_ uid: String) {

@@ -113,24 +113,74 @@ final class CoreAudioManager {
         return snapshot.first(where: { $0.isDefaultOutput })
     }
 
-    func preferredDevice(named name: String, stableUID: String? = nil) -> AudioDeviceInfo? {
+    func preferredDevice(
+        named name: String,
+        stableUID: String? = nil,
+        followActiveOutput: Bool = false
+    ) -> AudioDeviceInfo? {
         let current = devices()
-        return findPreferred(in: current, named: name, stableUID: stableUID)
+        return findPreferred(
+            in: current,
+            named: name,
+            stableUID: stableUID,
+            followActiveOutput: followActiveOutput
+        )
     }
 
-    func boundedPreferredDevice(named name: String, stableUID: String? = nil, timeout: TimeInterval = 2) -> AudioDeviceInfo? {
+    func boundedPreferredDevice(
+        named name: String,
+        stableUID: String? = nil,
+        followActiveOutput: Bool = false,
+        timeout: TimeInterval = 2
+    ) -> AudioDeviceInfo? {
         // A wedged unrelated endpoint can block the full device-list walk even
-        // after LS24A600U has reappeared. Once a UID is known, ask HAL for that
-        // device directly before falling back to a full snapshot.
+        // after an endpoint has reappeared. When following the active physical
+        // output, inspect the snapshot first so a deliberate switch to another
+        // monitor, USB DAC, Bluetooth speaker, or built-in output is adopted
+        // instead of being overwritten by the previous UID.
+        if followActiveOutput,
+           let current = boundedDevices(timeout: timeout) {
+            return findPreferred(
+                in: current,
+                named: name,
+                stableUID: stableUID,
+                followActiveOutput: true
+            )
+        }
         if let stableUID, !stableUID.isEmpty,
            let byUID = boundedDeviceForUID(stableUID, name: name, timeout: timeout) {
             return byUID
         }
         guard let current = boundedDevices(timeout: timeout) else { return nil }
-        return findPreferred(in: current, named: name, stableUID: stableUID)
+        return findPreferred(
+            in: current,
+            named: name,
+            stableUID: stableUID,
+            followActiveOutput: followActiveOutput
+        )
     }
 
-    private func findPreferred(in current: [AudioDeviceInfo], named name: String, stableUID: String? = nil) -> AudioDeviceInfo? {
+    private func findPreferred(
+        in current: [AudioDeviceInfo],
+        named name: String,
+        stableUID: String? = nil,
+        followActiveOutput: Bool = false
+    ) -> AudioDeviceInfo? {
+        let physicalOutputs = current.filter {
+            $0.isPhysicalOutput && $0.isAlive != false
+        }
+
+        // The current physical default is the user's active destination. This
+        // handles switches among DisplayPort/HDMI monitors, USB/Thunderbolt
+        // devices, Bluetooth speakers, and the Mac's built-in speakers.
+        let activeOutput = physicalOutputs.first(where: \.isDefaultOutput)
+            ?? physicalOutputs.first(where: \.isSystemOutput)
+        if followActiveOutput,
+           let active = activeOutput,
+           !active.isBuiltInOutput {
+            return active
+        }
+
         if let stableUID, !stableUID.isEmpty,
            let byUID = current.first(where: {
                !$0.uid.isEmpty && $0.uid.caseInsensitiveCompare(stableUID) == .orderedSame
@@ -142,7 +192,25 @@ final class CoreAudioManager {
         }) {
             return exact
         }
-        return current.first(where: { $0.name.localizedCaseInsensitiveContains(name) })
+        if let partial = physicalOutputs.first(where: {
+            $0.name.localizedCaseInsensitiveContains(name)
+        }) {
+            return partial
+        }
+
+        // If the configured or remembered endpoint is gone, use another
+        // connected physical output before virtual devices. Prefer an active
+        // external device, then any external device, and finally built-in.
+        if followActiveOutput {
+            let external = physicalOutputs.filter { !$0.isBuiltInOutput }
+            return external.first(where: { $0.isRunning == true })
+                ?? external.first(where: { $0.isDefaultOutput || $0.isSystemOutput })
+                ?? external.first
+                ?? activeOutput
+                ?? physicalOutputs.first(where: { $0.isRunning == true })
+                ?? physicalOutputs.first
+        }
+        return nil
     }
 
     private func boundedDeviceForUID(_ uid: String, name: String, timeout: TimeInterval) -> AudioDeviceInfo? {

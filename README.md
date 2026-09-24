@@ -2,7 +2,7 @@
 
 `DisplayAudioFix` is a native, dependency-free macOS command-line utility and LaunchDaemon for recovering DisplayPort/HDMI audio when the device remains enumerated but CoreAudio can no longer start playback, or when a hot-reconnected endpoint temporarily disappears from CoreAudio altogether.
 
-It was built for macOS 27.0 (26A428) and the preferred `LS24A600U` output. It discovers devices by name and re-reads their UID after a CoreAudio restart; no monitor UUID is hardcoded.
+It was first built around the `LS24A600U` failure on macOS 27.0 (26A428), but the recovery target is not limited to that monitor. In automatic mode it follows the current physical output, including another DisplayPort/HDMI monitor, USB/Thunderbolt audio device, Bluetooth speaker, or built-in speaker. The configured `LS24A600U` name is retained as the first-choice external fallback for existing installations.
 
 ### Important: the LS24A600U has no built-in speakers
 
@@ -39,19 +39,21 @@ There is a second reconnect failure mode: the display link and EDID remain prese
 
 DisplayAudioFix performs the following staged recovery:
 
-1. Pause the BetterDisplay user-session process before querying CoreAudio, so a stale `AudioQueue` does not keep the old DisplayPort I/O context wedged.
-2. Record the preferred endpoint UID if it can be enumerated. The UID is persisted in the state file and is queried directly after reconnect; a temporary enumeration timeout does not abort recovery.
+1. If the active target is a display, pause the BetterDisplay user-session process before querying CoreAudio, so a stale `AudioQueue` does not keep the old DisplayPort I/O context wedged.
+2. Resolve the active physical output. A user-selected external output wins; otherwise the persisted UID/name or configured `preferredDeviceName` is used. If that endpoint disappeared, another physical output is selected before falling back to a built-in speaker. The active UID/name is persisted so a monitor or speaker switch does not send audio back to the wrong endpoint.
 3. Select the built-in MacBook output when available, but continue if CoreAudio is too wedged to switch yet.
 4. Restart only `coreaudiod` with `launchctl kickstart -kp`.
-5. Poll for the DisplayPort endpoint to be enumerated again, then restore it as both default output and system output.
+5. Poll for the active physical endpoint to be enumerated again, then restore it as both default output and system output.
 6. Toggle its nominal rate and restore the original rate to rebuild its I/O context.
-7. Run a bounded silent `AudioQueue` playback probe on the monitor itself.
+7. Run a bounded silent `AudioQueue` playback probe on the active output.
 8. Relaunch BetterDisplay only after its old process has exited. When the
    recovery probe succeeds, read the monitor's DDC mute/volume state through
    BetterDisplay, write the same unmuted/volume values back to wake the
-   LS24A600U headphone jack, and reassert LS24A600U as the default after the
-   app has recreated its audio client. A reconnect-stale monitor mute is
-   cleared; the current volume level is preserved. If the probe fails, the built-in output remains selected
+   active monitor's headphone jack, and reassert that display as the default
+   after the app has recreated its audio client. A reconnect-stale monitor mute
+   is cleared; the current volume level is preserved. USB, Bluetooth, built-in,
+   and other non-display outputs use CoreAudio recovery without display-specific
+   DDC commands. If the probe fails, the built-in output remains selected
    and the watcher retries after the cooldown. A shared advisory lock prevents
    the system daemon, a user agent, and a manual `repair` command from resetting
    CoreAudio concurrently.
@@ -61,20 +63,21 @@ the existing logged-in user's LaunchServices session. If either the monitor or
 the built-in output is temporarily absent from CoreAudio's device list, the
 recovery still resets `coreaudiod` instead of stopping at the failed query.
 
-The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the preferred device every 30 seconds, and checks after sleep/wake. If CoreAudio reports no preferred device, the watcher enters the staged reset immediately; it does not wait for a future error line. There is no window-wide maximum-attempt block in the current implementation.
+The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the active physical output every 30 seconds, and checks after sleep/wake. If CoreAudio reports no active endpoint, the watcher enters the staged reset immediately; it does not wait for a future error line. There is no window-wide maximum-attempt block in the current implementation.
 
 ## What it does
 
 - Enumerates CoreAudio output devices, including transport, UID, sample rate, role, liveness/running state, and channel count. When the full HAL list is blocked, it uses the persisted endpoint UID without probing unrelated device properties.
+- Follows a deliberate switch among physical outputs instead of treating `LS24A600U` as a hard-coded monitor. Virtual meeting/capture devices are not selected automatically.
 - Watches the unified log for timeline, `1937010544`, `StartIOThread`, and `Device ... is not running` failures.
 - Runs a bounded, inaudible AudioQueue playback probe on the selected hardware.
-- Switches to built-in speakers, restarts `coreaudiod`, waits for device discovery, restores the preferred display output, then verifies playback.
+- Switches to a temporary built-in fallback, restarts `coreaudiod`, waits for device discovery, restores the active physical output, then verifies playback.
 - Enforces a 30-second minimum cooldown while continuing automatic recovery until a real playback probe succeeds; the cooldown is not an attempt limit.
-- Renegotiates the preferred display's nominal sample rate during recovery to rebuild a wedged DisplayPort I/O context on macOS 27.0.
+- Renegotiates the active physical output's nominal sample rate during recovery when the device exposes that property; this rebuilds a wedged DisplayPort/HDMI I/O context without changing display refresh rate.
 - Quiesces and relaunches BetterDisplay around recovery when its process is present. It waits up to five seconds for a graceful exit and escalates to `SIGKILL` only for that already-identified, non-root BetterDisplay process if it is wedged, so the stale AudioQueue cannot survive into the next reconnect.
-- After a successful recovery, clears a reconnect-stale LS24A600U monitor-side
-  DDC mute bit, re-writes the current volume level, and reasserts the display
-  as the default after BetterDisplay relaunches.
+- After a successful display recovery, clears a reconnect-stale monitor-side DDC
+  mute bit, re-writes the current volume level, and reasserts that display as
+  the default after BetterDisplay relaunches.
 - Leaves built-in speakers selected when repair does not restore healthy playback.
 - Rotates `/var/log/displayaudiofix.log` to one `.1` backup at 2 MiB.
 
@@ -152,6 +155,7 @@ Edit `/Library/Application Support/DisplayAudioFix/config.json`, then restart th
   "continuousRecovery" : true,
   "minimumRecoveryCooldownSeconds" : 30,
   "postWakeDelaySeconds" : 8,
+  "followActiveOutput" : true,
   "preferredDeviceName" : "LS24A600U",
   "recoveryWindowSeconds" : 300
 }
@@ -161,7 +165,11 @@ Edit `/Library/Application Support/DisplayAudioFix/config.json`, then restart th
 sudo launchctl kickstart -k system/com.displayaudiofix.daemon
 ```
 
-For a one-off source-tree test, `DISPLAYAUDIOFIX_PREFERRED_DEVICE` overrides the configured name. `DISPLAYAUDIOFIX_CONFIG` can point at another JSON file.
+With `followActiveOutput: true`, the watcher follows the current physical
+output when you switch monitors or speakers. Set it to `false` to pin recovery
+to `preferredDeviceName`. For a one-off source-tree test,
+`DISPLAYAUDIOFIX_PREFERRED_DEVICE` overrides the configured name.
+`DISPLAYAUDIOFIX_CONFIG` can point at another JSON file.
 
 ## Commands
 
@@ -180,9 +188,9 @@ displayaudiofix uninstall
 
 `repair`, `install`, and `uninstall` prompt through `sudo` when not already root. A manual repair bypasses automatic rate limiting, but still performs one staged recovery and one delayed post-recovery probe retry. Automatic recovery has no window-wide attempt cap; the cooldown only prevents concurrent/tight-loop restarts.
 
-`set-rate` is a diagnostic/recovery command for the configured preferred device. It changes the CoreAudio nominal sample-rate property; it does not change display resolution or refresh rate.
+`set-rate` is a diagnostic/recovery command for the active/configured output. It changes the CoreAudio nominal sample-rate property; it does not change display resolution or refresh rate.
 
-`restore` first runs the real silent playback probe and only then selects the preferred display output as both default and system output. It is useful after a reconnect when the endpoint is healthy again but macOS is still left on the built-in speakers; it does not require administrator privileges.
+`restore` first runs the real silent playback probe and only then selects the active physical output as both default and system output. It is useful after a reconnect when the endpoint is healthy again but macOS is still left on the wrong output; it does not require administrator privileges.
 
 ## Uninstall
 
@@ -212,7 +220,7 @@ displayaudiofix test
 log show --last 10m --style compact --predicate 'process == "coreaudiod"'
 ```
 
-If `status` reports the built-in speakers, that is a protective fallback, not a successful repair. Success requires `LS24A600U` as the current default and `HEALTHY` from the active probe.
+If `status` reports the built-in speakers while an external output is connected, inspect `displayaudiofix devices` and the current macOS Sound output selection. In automatic mode, the selected physical output—not a hard-coded `LS24A600U`—must be the current default and return `HEALTHY` from the active probe.
 
 ## Safety And Scope
 

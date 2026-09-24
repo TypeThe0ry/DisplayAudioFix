@@ -15,8 +15,8 @@ func usage() -> Never {
       status                 concise device, health, daemon, and recovery status
       devices                enumerate CoreAudio output devices
       test [--audible]       run a bounded silent (or quiet audible) playback probe
-      restore                select the preferred output after a successful probe
-      set-rate <hz>          set the preferred device nominal sample rate
+      restore                select the active physical output after a successful probe
+      set-rate <hz>          set the active/configured output nominal sample rate
       repair                 run staged recovery (uses sudo when needed)
       watch                  monitor CoreAudio and recover automatically
       logs [--follow]        show the DisplayAudioFix log
@@ -56,11 +56,17 @@ func todayKey() -> String {
     return formatter.string(from: Date())
 }
 
+func activeDeviceName() -> String {
+    stateStore.load().activeDeviceName ?? config.preferredDeviceName
+}
+
 func commandStatus() {
     let state = stateStore.load()
+    let targetName = state.activeDeviceName ?? config.preferredDeviceName
     let preferred = audio.boundedPreferredDevice(
-        named: config.preferredDeviceName,
+        named: targetName,
         stableUID: state.preferredDeviceUID,
+        followActiveOutput: config.followActiveOutput,
         timeout: 2
     )
     let current = audio.boundedDefaultOutputDevice(timeout: 2)
@@ -77,7 +83,13 @@ func commandStatus() {
     macOS: \(version) (\(build))
 
     Preferred device:
-      \(config.preferredDeviceName)\(preferred == nil ? " (not connected)" : "")
+      \(config.preferredDeviceName)
+
+    Active output:
+      \(preferred?.name ?? targetName)\(preferred == nil ? " (not connected)" : "")
+
+    Display switching:
+      \(config.followActiveOutput ? "automatic (current physical output)" : "fixed to configured device")
 
     Current default:
       \(current?.name ?? "none")
@@ -89,7 +101,7 @@ func commandStatus() {
       \(current.map { String(format: "%.0f Hz", $0.sampleRate) } ?? "unknown")
 
     Output path:
-      \(current?.isDisplayAudio == true ? "DisplayPort digital stream; final volume is controlled by the monitor/headphone sink" : "CoreAudio software-controlled output")
+      \(current?.isDisplayAudio == true ? "DisplayPort/HDMI digital stream; final volume is controlled by the monitor/headphone sink" : "CoreAudio physical output")
 
     Health:
       \(health)
@@ -138,21 +150,27 @@ func commandDevices() {
 }
 
 func commandTest(audible: Bool) -> Int32 {
+    let state = stateStore.load()
+    let targetName = state.activeDeviceName ?? config.preferredDeviceName
     let target = audio.boundedPreferredDevice(
-        named: config.preferredDeviceName,
-        stableUID: stateStore.load().preferredDeviceUID,
+        named: targetName,
+        stableUID: state.preferredDeviceUID,
+        followActiveOutput: config.followActiveOutput,
         timeout: 2
     ) ?? audio.boundedDefaultOutputDevice(timeout: 2)
-    print("Testing \(target?.name ?? config.preferredDeviceName)\(audible ? " with a 0.8s 880 Hz listening tone" : " with silence")...")
+    print("Testing \(target?.name ?? targetName)\(audible ? " with a 0.8s 880 Hz listening tone" : " with silence")...")
     let result = checker.test(device: target, timeout: config.healthCheckTimeoutSeconds, audible: audible)
     print(result)
     return result == .healthy ? 0 : 1
 }
 
 func commandRestore() -> Int32 {
+    let state = stateStore.load()
+    let targetName = state.activeDeviceName ?? config.preferredDeviceName
     guard let preferred = audio.boundedPreferredDevice(
-        named: config.preferredDeviceName,
-        stableUID: stateStore.load().preferredDeviceUID,
+        named: targetName,
+        stableUID: state.preferredDeviceUID,
+        followActiveOutput: config.followActiveOutput,
         timeout: 2
     ) else {
         fputs("preferred output is not currently enumerated\n", stderr)
@@ -176,7 +194,11 @@ func commandRestore() -> Int32 {
 
 func commandSetRate(_ value: String?) -> Never {
     guard let value, let rate = Double(value), rate > 0,
-          let preferred = audio.preferredDevice(named: config.preferredDeviceName) else {
+          let preferred = audio.preferredDevice(
+              named: activeDeviceName(),
+              stableUID: stateStore.load().preferredDeviceUID,
+              followActiveOutput: config.followActiveOutput
+          ) else {
         fputs("usage: displayaudiofix set-rate <positive-hz>\n", stderr)
         exit(2)
     }
