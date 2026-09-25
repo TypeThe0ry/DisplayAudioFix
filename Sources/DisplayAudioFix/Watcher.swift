@@ -163,11 +163,11 @@ final class Watcher {
     }
 
     private func startPeriodicHealthChecks() {
-        // A stale config from an older build must not restore a long interval
-        // that effectively disables continuous recovery. Keep the retry cadence
-        // bounded to at most 30 seconds while honoring a larger minimum only
-        // through a future explicit policy change.
-        let interval = min(max(config.healthCheckIntervalSeconds, 30), 30)
+        // Keep a sensible lower bound, but honor the configured interval. The
+        // previous code accidentally forced every installation to probe every
+        // 30 seconds; when CoreAudio was missing a monitor that became an
+        // unnecessary restart/CPU loop.
+        let interval = max(config.healthCheckIntervalSeconds, 30)
         let timer = DispatchSource.makeTimerSource(queue: workQueue)
         timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(5))
         timer.setEventHandler { [weak self] in self?.healthCheckIfUseful(reason: "periodic health check") }
@@ -207,6 +207,7 @@ final class Watcher {
         rememberPreferredDevice(preferred)
         let result = checker.test(device: preferred, timeout: config.healthCheckTimeoutSeconds, audible: false)
         if result == .healthy {
+            recovery.noteHealthyOutput()
             retryScheduled = false
             if preferred.isDefaultOutput && preferred.isSystemOutput {
                 logger.log("\(reason): HEALTHY", alsoPrint: false)

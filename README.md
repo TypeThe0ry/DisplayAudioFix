@@ -33,7 +33,7 @@ The observed cause is a macOS/CoreAudio DisplayPort I/O-context failure: the end
 
 In testing, changing the endpoint's documented nominal sample-rate property from 48 kHz to 44.1 kHz and back to 48 kHz forced CoreAudio to renegotiate the wedged I/O context. The next real silent playback probe returned `HEALTHY`. This is an empirical workaround for this macOS 27.0 failure mode; it does not change display refresh rate.
 
-There is a second reconnect failure mode: the display link and EDID remain present, but the CoreAudio endpoint is absent or a full HAL device walk blocks on another stale endpoint. The repair now remembers the last good device UID, asks CoreAudio for that UID directly, and treats a missing endpoint as a recovery trigger instead of waiting forever for another log event. UID lookup, device enumeration, default-output writes, and sample-rate writes are all bounded and single-flight, so a wedged CoreAudio call cannot stop the watcher or create an unbounded pile of worker threads.
+There is a second reconnect failure mode: the display link and EDID remain present, but the CoreAudio endpoint is absent or a full HAL device walk blocks on another stale endpoint. The repair remembers the last good device UID, but never treats UID translation alone as proof that the device is still connected: the endpoint's real CoreAudio properties must be readable before it can be selected. A disconnected monitor therefore falls back to the currently enumerable built-in or other physical output instead of sending audio to a stale DisplayPort UID. UID lookup, device enumeration, default-output writes, and sample-rate writes are all bounded and have a small cap on timed-out replacement workers, so a wedged CoreAudio call cannot stop the watcher or create an unbounded pile of worker threads.
 
 ## Recovery Method
 
@@ -63,16 +63,16 @@ the existing logged-in user's LaunchServices session. If either the monitor or
 the built-in output is temporarily absent from CoreAudio's device list, the
 recovery still resets `coreaudiod` instead of stopping at the failed query.
 
-The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the active physical output every 30 seconds, and checks after sleep/wake. If CoreAudio reports no active endpoint, the watcher enters the staged reset immediately; it does not wait for a future error line. There is no window-wide maximum-attempt block in the current implementation.
+The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the active physical output at the configured interval (with a 30-second minimum), and checks after sleep/wake. If CoreAudio reports no active endpoint, the watcher enters the staged reset immediately; it does not wait for a future error line. Failed recoveries use an adaptive delay (up to five minutes) before the next reset, so an unplugged monitor or a wedged third-party driver cannot cause a coreaudiod restart/CPU storm. Recovery never gives up; a healthy physical output clears the delay immediately.
 
 ## What it does
 
-- Enumerates CoreAudio output devices, including transport, UID, sample rate, role, liveness/running state, and channel count. When the full HAL list is blocked, it uses the persisted endpoint UID without probing unrelated device properties.
+- Enumerates CoreAudio output devices, including transport, UID, sample rate, role, liveness/running state, and channel count. When the full HAL list is blocked, a persisted endpoint UID is accepted only after the endpoint's real properties can be read; a stale disconnected monitor is never manufactured as a live DisplayPort device.
 - Follows a deliberate switch among physical outputs instead of treating `LS24A600U` as a hard-coded monitor. Virtual meeting/capture devices are not selected automatically.
 - Watches the unified log for timeline, `1937010544`, `StartIOThread`, and `Device ... is not running` failures.
 - Runs a bounded, inaudible AudioQueue playback probe on the selected hardware.
 - Switches to a temporary built-in fallback, restarts `coreaudiod`, waits for device discovery, restores the active physical output, then verifies playback.
-- Enforces a 30-second minimum cooldown while continuing automatic recovery until a real playback probe succeeds; the cooldown is not an attempt limit.
+- Enforces a minimum cooldown plus adaptive backoff while continuing automatic recovery until a real playback probe succeeds; the delay is not an attempt limit.
 - Renegotiates the active physical output's nominal sample rate during recovery when the device exposes that property; this rebuilds a wedged DisplayPort/HDMI I/O context without changing display refresh rate.
 - Quiesces and relaunches BetterDisplay around recovery when its process is present. It waits up to five seconds for a graceful exit and escalates to `SIGKILL` only for that already-identified, non-root BetterDisplay process if it is wedged, so the stale AudioQueue cannot survive into the next reconnect.
 - After a successful display recovery, clears a reconnect-stale monitor-side DDC

@@ -15,6 +15,12 @@ final class RecoveryManager {
     private let logger = AppLogger.shared
     private let lock = NSLock()
     private var inProgress = false
+    // A failed recovery must not turn into a restart storm when CoreAudio has
+    // lost the display endpoint or a third-party virtual driver is wedged.
+    // Back off progressively, but never give up: a later health check can
+    // reset the backoff as soon as a real physical output is healthy again.
+    private var consecutiveFailures = 0
+    private var nextRecoveryAllowedAt = Date.distantPast
 
     init(audio: CoreAudioManager, checker: HealthChecker, config: Configuration, stateStore: StateStore) {
         self.audio = audio
@@ -30,6 +36,12 @@ final class RecoveryManager {
         let now = Date()
         state.recoveryTimestamps = state.recoveryTimestamps.filter {
             now.timeIntervalSince($0) < config.recoveryWindowSeconds
+        }
+        if now < nextRecoveryAllowedAt {
+            let remaining = max(1, Int(ceil(nextRecoveryAllowedAt.timeIntervalSince(now))))
+            lock.unlock()
+            logger.log("recovery suppressed: adaptive backoff active; retrying in \(remaining)s (trigger: \(trigger))")
+            return false
         }
         if let last = state.lastRecovery,
            now.timeIntervalSince(last) < config.minimumRecoveryCooldownSeconds {
@@ -60,10 +72,28 @@ final class RecoveryManager {
             logger.log("recovery skipped: another DisplayAudioFix repair is already running")
             return false
         }
+        var recoverySucceeded = false
         defer {
             flock(sharedLock, LOCK_UN)
             close(sharedLock)
-            lock.lock(); inProgress = false; lock.unlock()
+            lock.lock()
+            inProgress = false
+            if recoverySucceeded {
+                consecutiveFailures = 0
+                nextRecoveryAllowedAt = .distantPast
+            } else {
+                consecutiveFailures = min(consecutiveFailures + 1, 6)
+                let base = max(config.minimumRecoveryCooldownSeconds, 30)
+                let delay = min(base * pow(2, Double(max(0, consecutiveFailures - 1))), 300)
+                nextRecoveryAllowedAt = Date().addingTimeInterval(delay)
+            }
+            let failures = consecutiveFailures
+            let nextRetry = nextRecoveryAllowedAt
+            lock.unlock()
+            if !recoverySucceeded {
+                let seconds = max(1, Int(ceil(nextRetry.timeIntervalSinceNow)))
+                logger.log("recovery failed; adaptive backoff \(seconds)s (consecutive failures: \(failures))")
+            }
         }
         recordAttempt()
         logger.log("recovery started (trigger: \(trigger))")
@@ -269,7 +299,18 @@ final class RecoveryManager {
         }
         stateStore.save(finalState)
         shouldReassertPreferredAfterBetterDisplay = true
+        recoverySucceeded = true
         return true
+    }
+
+    /// A healthy, real output means the system is no longer in a recovery
+    /// storm. Clear the adaptive delay so a newly connected monitor is picked
+    /// up promptly instead of waiting for the previous failure backoff.
+    func noteHealthyOutput() {
+        lock.lock()
+        consecutiveFailures = 0
+        nextRecoveryAllowedAt = .distantPast
+        lock.unlock()
     }
 
     private func selectFreshFallback(named oldName: String?) {

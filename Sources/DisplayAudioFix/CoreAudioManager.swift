@@ -246,25 +246,22 @@ final class CoreAudioManager {
                 self?.uidQueryLock.unlock()
                 semaphore.signal()
             }
-            guard let self, let id = self.deviceID(forUID: uid), id != AudioDeviceID(kAudioObjectUnknown) else { return }
-            // Do not read a second property here. A stale endpoint can make
-            // any per-device property call block forever even though the UID
-            // translation succeeded. The AudioQueue probe below is the
-            // authoritative liveness check, so return a conservative record
-            // and let recovery validate it instead of wedging this worker.
-            box.value = AudioDeviceInfo(
-                id: id,
-                name: name,
-                uid: uid,
-                transportRawValue: kAudioDeviceTransportTypeDisplayPort,
-                transport: "DisplayPort",
-                sampleRate: 48_000,
-                isDefaultOutput: false,
-                isSystemOutput: false,
-                isAlive: true,
-                isRunning: nil,
-                outputChannels: 2
-            )
+            guard let self,
+                  let id = self.deviceID(forUID: uid),
+                  id != AudioDeviceID(kAudioObjectUnknown) else { return }
+
+            // UID translation alone is not proof that an endpoint is still
+            // connected. CoreAudio can retain a stale UID while a monitor is
+            // unplugged, and the old implementation manufactured a
+            // DisplayPort record here. That made the watcher keep probing a
+            // display that no longer existed and repeatedly restart
+            // coreaudiod. Read the real device properties on this bounded
+            // worker instead; if the endpoint has disappeared or its HAL
+            // properties are wedged, return nil and let recovery select a
+            // currently enumerable physical fallback.
+            let defaultID = self.defaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice)
+            let systemID = self.defaultDevice(selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+            box.value = self.deviceInfoUnbounded(id, defaultID: defaultID, systemID: systemID)
         }
         guard semaphore.wait(timeout: .now() + max(timeout, 0.1)) == .success else {
             return nil
