@@ -180,12 +180,13 @@ final class CoreAudioManager {
 
         // The current physical default is the user's active destination. This
         // handles switches among DisplayPort/HDMI monitors, USB/Thunderbolt
-        // devices, Bluetooth speakers, and the Mac's built-in speakers.
+        // devices, Bluetooth speakers, and the Mac's built-in speakers. Keep
+        // the built-in output too: selecting MacBook speakers while a monitor
+        // remains connected is an intentional user choice, not a disconnect
+        // that should be silently redirected to display audio.
         let activeOutput = physicalOutputs.first(where: \.isDefaultOutput)
             ?? physicalOutputs.first(where: \.isSystemOutput)
-        if followActiveOutput,
-           let active = activeOutput,
-           !active.isBuiltInOutput {
+        if followActiveOutput, let active = activeOutput {
             return active
         }
 
@@ -193,14 +194,6 @@ final class CoreAudioManager {
            let byUID = current.first(where: {
                !$0.uid.isEmpty && $0.uid.caseInsensitiveCompare(stableUID) == .orderedSame
            }) {
-            // A built-in endpoint may only be the temporary fallback from a
-            // previous disconnect. If an external physical output is now
-            // connected, resume external audio instead of locking onto the
-            // fallback forever.
-            if followActiveOutput, byUID.isBuiltInOutput,
-               let external = physicalOutputs.first(where: { !$0.isBuiltInOutput }) {
-                return external
-            }
             return byUID
         }
         if let exact = current.first(where: {
@@ -216,13 +209,9 @@ final class CoreAudioManager {
 
         // If the configured or remembered endpoint is gone, use another
         // connected physical output before virtual devices. Prefer an active
-        // external device, then any external device, and finally built-in.
+        // output, then a running output, and finally any physical output.
         if followActiveOutput {
-            let external = physicalOutputs.filter { !$0.isBuiltInOutput }
-            return external.first(where: { $0.isRunning == true })
-                ?? external.first(where: { $0.isDefaultOutput || $0.isSystemOutput })
-                ?? external.first
-                ?? activeOutput
+            return activeOutput
                 ?? physicalOutputs.first(where: { $0.isRunning == true })
                 ?? physicalOutputs.first
         }

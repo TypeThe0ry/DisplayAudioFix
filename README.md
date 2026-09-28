@@ -2,7 +2,7 @@
 
 `DisplayAudioFix` is a native, dependency-free macOS command-line utility and LaunchDaemon for recovering DisplayPort/HDMI audio when the device remains enumerated but CoreAudio can no longer start playback, or when a hot-reconnected endpoint temporarily disappears from CoreAudio altogether.
 
-It was first built around the `LS24A600U` failure on macOS 27.0 (26A428), but the recovery target is not limited to that monitor. In automatic mode it follows the current physical output, including another DisplayPort/HDMI monitor, USB/Thunderbolt audio device, Bluetooth speaker, or built-in speaker. The configured `LS24A600U` name is retained as the first-choice external fallback for existing installations.
+It was first built around the `LS24A600U` failure on macOS 27.0 (26A428), but the recovery target is not limited to that monitor. In automatic mode it follows the current physical output, including another DisplayPort/HDMI monitor, USB/Thunderbolt audio device, Bluetooth speaker, or built-in speaker. If the user deliberately selects the MacBook speakers while a monitor is connected, that built-in choice is preserved; the configured `LS24A600U` name is only a fallback when the current physical endpoint cannot be enumerated.
 
 ### Important: the LS24A600U has no built-in speakers
 
@@ -35,6 +35,8 @@ In testing, changing the endpoint's documented nominal sample-rate property from
 
 There is a second reconnect failure mode: the display link and EDID remain present, but the CoreAudio endpoint is absent or a full HAL device walk blocks on another stale endpoint. The repair remembers the last good device UID, but never treats UID translation alone as proof that the device is still connected: the endpoint's real CoreAudio properties must be readable before it can be selected. A disconnected monitor therefore falls back to the currently enumerable built-in or other physical output instead of sending audio to a stale DisplayPort UID. UID lookup, device enumeration, default-output writes, and sample-rate writes are all bounded and have a small cap on timed-out replacement workers, so a wedged CoreAudio call cannot stop the watcher or create an unbounded pile of worker threads.
 
+The watcher also gates display recovery on the graphics display list (`CGGetOnlineDisplayList`). When no external display is online, it does not interpret CoreAudio timeline/IO-thread log bursts as a display failure and does not restart `coreaudiod` from those log events. This prevents a stale DisplayPort UID or a third-party HAL driver (for example a remote-desktop audio driver) from creating a 100% CPU restart loop while the Mac is correctly using its built-in or another non-display output.
+
 ## Recovery Method
 
 DisplayAudioFix performs the following staged recovery:
@@ -63,12 +65,12 @@ the existing logged-in user's LaunchServices session. If either the monitor or
 the built-in output is temporarily absent from CoreAudio's device list, the
 recovery still resets `coreaudiod` instead of stopping at the failed query.
 
-The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the active physical output at the configured interval (with a 30-second minimum), and checks after sleep/wake. If CoreAudio reports no active endpoint, the watcher enters the staged reset immediately; it does not wait for a future error line. Failed recoveries use an adaptive delay (up to five minutes) before the next reset, so an unplugged monitor or a wedged third-party driver cannot cause a coreaudiod restart/CPU storm. Recovery never gives up; a healthy physical output clears the delay immediately.
+The watcher also monitors relevant unified-log events, coalesces duplicate lines from one failure burst, checks the active physical output at the configured interval (with a 30-second minimum), and checks after sleep/wake. If CoreAudio reports no active endpoint while an external display is online, the watcher enters the staged reset immediately; it does not wait for a future error line. With no external display, it waits without display-audio recovery. Failed recoveries use an adaptive delay (up to five minutes) before the next reset, so an unplugged monitor or a wedged third-party driver cannot cause a coreaudiod restart/CPU storm. Recovery never gives up; a healthy physical output clears the delay immediately.
 
 ## What it does
 
 - Enumerates CoreAudio output devices, including transport, UID, sample rate, role, liveness/running state, and channel count. When the full HAL list is blocked, a persisted endpoint UID is accepted only after the endpoint's real properties can be read; a stale disconnected monitor is never manufactured as a live DisplayPort device.
-- Follows a deliberate switch among physical outputs instead of treating `LS24A600U` as a hard-coded monitor. Virtual meeting/capture devices are not selected automatically.
+- Follows a deliberate switch among physical outputs instead of treating `LS24A600U` as a hard-coded monitor, including an intentional switch back to the MacBook speakers. Virtual meeting/capture devices are not selected automatically.
 - Watches the unified log for timeline, `1937010544`, `StartIOThread`, and `Device ... is not running` failures.
 - Runs a bounded, inaudible AudioQueue playback probe on the selected hardware.
 - Switches to a temporary built-in fallback, restarts `coreaudiod`, waits for device discovery, restores the active physical output, then verifies playback.

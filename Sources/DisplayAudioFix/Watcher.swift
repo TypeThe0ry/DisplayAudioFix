@@ -151,6 +151,16 @@ final class Watcher {
             followActiveOutput: config.followActiveOutput,
             timeout: 1.5
         )
+        // A stale DisplayPort UID can produce CoreAudio failures after the
+        // monitor has physically been unplugged. Do not turn any log burst
+        // into an automatic coreaudiod restart when WindowServer confirms
+        // that there is no external display at all: third-party HAL drivers
+        // (for example remote-desktop audio) can emit the same error while
+        // the active output is the built-in speaker. The bounded periodic
+        // health probe still handles a real USB/Bluetooth/built-in failure.
+        if !DisplayPresence.hasExternalDisplay() {
+            return false
+        }
         if let preferred, !preferred.uid.isEmpty {
             rememberPreferredDevice(preferred)
         }
@@ -194,6 +204,11 @@ final class Watcher {
             timeout: 1.5
         ) else {
             logger.log("\(reason): preferred device missing or CoreAudio enumeration timed out", alsoPrint: false)
+            if !DisplayPresence.hasExternalDisplay() {
+                logger.log("\(reason): no external display is connected; waiting without display-audio recovery", alsoPrint: false)
+                scheduleRetry(reason: "waiting for external display", delay: 30)
+                return
+            }
             // A missing endpoint is itself a recovery condition. Waiting for a
             // future log line can deadlock forever when coreaudiod has stopped
             // publishing device events, so run the staged reset directly.
@@ -238,11 +253,11 @@ final class Watcher {
         }
     }
 
-    private func scheduleRetry(reason: String) {
+    private func scheduleRetry(reason: String, delay: TimeInterval = 15) {
         guard !retryScheduled else { return }
         retryScheduled = true
         let compactReason = reason.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? "recovery retry"
-        workQueue.asyncAfter(deadline: .now() + 15) { [weak self] in
+        workQueue.asyncAfter(deadline: .now() + max(delay, 5)) { [weak self] in
             guard let self else { return }
             self.retryScheduled = false
             self.healthCheckIfUseful(reason: "retry after \(compactReason)")
