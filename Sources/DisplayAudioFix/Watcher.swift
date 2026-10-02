@@ -164,9 +164,14 @@ final class Watcher {
         if let preferred, !preferred.uid.isEmpty {
             rememberPreferredDevice(preferred)
         }
-        if let current, current.isPhysicalOutput { return true }
+        // A virtual HAL error can occur while the user is deliberately using
+        // the built-in speaker, a USB DAC, or a Bluetooth device.  The mere
+        // presence of an external display is not evidence that its audio
+        // endpoint failed.  Only a display transport that is currently the
+        // active output should authorize the disruptive coreaudiod reset.
+        if let current, current.isDisplayAudio { return true }
         if let current, current.name.caseInsensitiveCompare(targetName) == .orderedSame { return true }
-        if let preferred, preferred.isDefaultOutput || preferred.isSystemOutput { return true }
+        if let preferred, preferred.isDisplayAudio && (preferred.isDefaultOutput || preferred.isSystemOutput) { return true }
         if let preferred, !preferred.uid.isEmpty && logLine.contains(preferred.uid.lowercased()) { return true }
         if let uid = preferredUID(), logLine.contains(uid) { return true }
         return logLine.contains(targetName.lowercased()) || logLine.contains(config.preferredDeviceName.lowercased())
