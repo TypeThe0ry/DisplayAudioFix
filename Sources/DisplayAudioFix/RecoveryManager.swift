@@ -59,7 +59,7 @@ final class RecoveryManager {
     }
 
     @discardableResult
-    func recover(trigger: String, bypassRateLimit: Bool = false) -> Bool {
+    func recover(trigger: String, bypassRateLimit: Bool = false, allowCoreAudioRestart: Bool = false) -> Bool {
         if !bypassRateLimit && !mayRecover(trigger: trigger) { return false }
         if bypassRateLimit {
             lock.lock()
@@ -97,6 +97,11 @@ final class RecoveryManager {
         }
         recordAttempt()
         logger.log("recovery started (trigger: \(trigger))")
+
+        guard allowCoreAudioRestart else {
+            logger.log("recovery aborted safely: CoreAudio restart is not authorized for automatic mode")
+            return false
+        }
 
         let initialState = stateStore.load()
         var activeDeviceName = initialState.activeDeviceName ?? config.preferredDeviceName

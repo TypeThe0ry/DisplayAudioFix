@@ -155,6 +155,7 @@ Edit `/Library/Application Support/DisplayAudioFix/config.json`, then restart th
   "healthCheckIntervalSeconds" : 30,
   "healthCheckTimeoutSeconds" : 3,
   "continuousRecovery" : true,
+  "allowAutomaticCoreAudioRestart" : false,
   "minimumRecoveryCooldownSeconds" : 30,
   "postWakeDelaySeconds" : 8,
   "followActiveOutput" : true,
@@ -166,6 +167,14 @@ Edit `/Library/Application Support/DisplayAudioFix/config.json`, then restart th
 ```sh
 sudo launchctl kickstart -k system/com.displayaudiofix.daemon
 ```
+
+Automatic watching is deliberately non-disruptive by default:
+`allowAutomaticCoreAudioRestart: false` lets it observe the current physical
+output and log a failed probe without restarting `coreaudiod`, because a full
+restart can amplify a macOS HAL/AirPlay registration storm and disconnect
+microphone or meeting-app sessions. Use the explicit `displayaudiofix repair`
+command for one staged restart when needed. Set the flag to `true` only when
+you have confirmed that the machine's third-party HAL drivers are stable.
 
 With `followActiveOutput: true`, the watcher follows the current physical
 output when you switch monitors or speakers. Set it to `false` to pin recovery

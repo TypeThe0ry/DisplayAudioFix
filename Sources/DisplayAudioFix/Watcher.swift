@@ -252,7 +252,12 @@ final class Watcher {
     }
 
     private func performRecovery(trigger: String) {
-        let succeeded = recovery.recover(trigger: trigger)
+        guard config.allowAutomaticCoreAudioRestart else {
+            logger.log("automatic recovery is monitor-only; refusing to restart coreaudiod (trigger: \(trigger))")
+            scheduleRetry(reason: "automatic restart disabled", delay: 60)
+            return
+        }
+        let succeeded = recovery.recover(trigger: trigger, allowCoreAudioRestart: true)
         if !succeeded {
             scheduleRetry(reason: "recovery did not complete")
         }

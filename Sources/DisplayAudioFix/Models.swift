@@ -12,12 +12,16 @@ struct Configuration: Codable {
     var healthCheckTimeoutSeconds: TimeInterval = 3
     var minimumRecoveryCooldownSeconds: TimeInterval = 30
     var continuousRecovery: Bool = true
+    /// Automatic watching is intentionally non-disruptive. A full CoreAudio
+    /// restart is reserved for an explicit `displayaudiofix repair` command;
+    /// automatic restarts can amplify a macOS HAL/AirPlay registration storm.
+    var allowAutomaticCoreAudioRestart: Bool = false
     var recoveryWindowSeconds: TimeInterval = 300
 
     private enum CodingKeys: String, CodingKey {
         case preferredDeviceName, followActiveOutput, healthCheckIntervalSeconds, postWakeDelaySeconds
         case healthCheckTimeoutSeconds, minimumRecoveryCooldownSeconds
-        case continuousRecovery, recoveryWindowSeconds
+        case continuousRecovery, allowAutomaticCoreAudioRestart, recoveryWindowSeconds
     }
 
     init() {}
@@ -31,6 +35,7 @@ struct Configuration: Codable {
         healthCheckTimeoutSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .healthCheckTimeoutSeconds) ?? 3
         minimumRecoveryCooldownSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .minimumRecoveryCooldownSeconds) ?? 30
         continuousRecovery = try container.decodeIfPresent(Bool.self, forKey: .continuousRecovery) ?? true
+        allowAutomaticCoreAudioRestart = try container.decodeIfPresent(Bool.self, forKey: .allowAutomaticCoreAudioRestart) ?? false
         recoveryWindowSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .recoveryWindowSeconds) ?? 300
     }
 

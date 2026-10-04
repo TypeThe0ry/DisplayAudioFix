@@ -219,7 +219,7 @@ func commandRepair() -> Never {
         let result = ProcessRunner.run("/usr/bin/sudo", [executable, "repair"], passthrough: true)
         exit(result.status)
     }
-    exit(recovery.recover(trigger: "manual repair", bypassRateLimit: true) ? 0 : 1)
+    exit(recovery.recover(trigger: "manual repair", bypassRateLimit: true, allowCoreAudioRestart: true) ? 0 : 1)
 }
 
 func commandLogs(follow: Bool) -> Never {
