@@ -23,6 +23,8 @@ final class Watcher {
     // CoreAudio can emit several lines for one failed start. Coalesce that burst
     // while leaving the periodic probe responsible for the next retry.
     private var lastLogRecoveryAt = Date.distantPast
+    private let logBurstLock = NSLock()
+    private var lastLogProbeAt = Date.distantPast
     // Keep the last known endpoint identity even while CoreAudio temporarily
     // reports an empty device list. UID-only coreaudiod errors must still wake
     // the recovery path during that gap.
@@ -126,9 +128,17 @@ final class Watcher {
         // context. That transition is not a failure; treating it as one can
         // restart coreaudiod in the middle of BetterDisplay's re-enumeration.
         guard hardTimelineFailure || deviceStopped || lower.contains("1937010544") || failedStart else { return }
-        if let uid = observedUID(in: line) {
-            rememberPreferredUID(uid)
+        // Check graphics presence before any HAL query. A stale/virtual
+        // driver can emit a large burst while no monitor is connected.
+        guard DisplayPresence.hasExternalDisplay() else { return }
+        logBurstLock.lock()
+        let now = Date()
+        guard now.timeIntervalSince(lastLogProbeAt) >= 10 else {
+            logBurstLock.unlock()
+            return
         }
+        lastLogProbeAt = now
+        logBurstLock.unlock()
         guard shouldTreatAsDisplayFailure(logLine: lower) else {
             return
         }

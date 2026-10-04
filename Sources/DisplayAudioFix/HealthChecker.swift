@@ -37,13 +37,27 @@ private let audioQueueOutputCallback: AudioQueueOutputCallback = { userData, _, 
 
 final class HealthChecker {
     private let timelineFailureStatus = OSStatus(bitPattern: 1_937_010_544)
+    private let probeLock = NSLock()
+    private var probeInFlight = false
 
     func test(device: AudioDeviceInfo?, timeout: TimeInterval, audible: Bool) -> HealthStatus {
+        probeLock.lock()
+        guard !probeInFlight else {
+            probeLock.unlock()
+            return .timelineTimeout
+        }
+        probeInFlight = true
+        probeLock.unlock()
         // AudioQueueStart itself can block for CoreAudio's 10-second timeline wait.
         // Keep the public probe bounded independently of every CoreAudio call.
         let completion = DispatchSemaphore(value: 0)
         let resultBox = ProbeResultBox()
         DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer {
+                probeLock.lock()
+                probeInFlight = false
+                probeLock.unlock()
+            }
             resultBox.set(performTest(device: device, timeout: timeout, audible: audible))
             completion.signal()
         }

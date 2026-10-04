@@ -279,7 +279,7 @@ final class RecoveryManager {
                     stableUID = fresh.uid
                 }
                 rememberActiveTarget(fresh)
-                try? audio.setDefaultOutput(fresh)
+                _ = audio.boundedSetDefaultOutput(fresh, timeout: 2)
                 result = checker.test(device: fresh, timeout: config.healthCheckTimeoutSeconds, audible: false)
             } else {
                 result = .deviceMissing
@@ -323,7 +323,7 @@ final class RecoveryManager {
             audio.boundedDevices(timeout: 1.5)?.first(where: { $0.name == name })
         }
         if let fresh = namedFallback ?? audio.boundedBuiltInFallback(timeout: 1.5) {
-            try? audio.setDefaultOutput(fresh)
+            _ = audio.boundedSetDefaultOutput(fresh, timeout: 2)
         }
     }
 
